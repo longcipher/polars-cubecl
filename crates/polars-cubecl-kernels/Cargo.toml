@@ -1,0 +1,14 @@
+[package]
+name = "polars-cubecl-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cubecl = { workspace = true }
+cubecl-runtime = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

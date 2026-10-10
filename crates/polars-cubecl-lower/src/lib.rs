@@ -1,0 +1,1739 @@
+//! Lowering from Polars IR to the engine's [`CubePlan`].
+//!
+//! This is the only crate that reads Polars internals (`IR`, `AExpr`). It
+//! walks the optimized plan handed over by `_collect_post_opt` and decides,
+//! per node and per expression, whether the engine can execute it. Anything
+//! outside the supported subset yields [`LowerError::Unsupported`], which the
+//! facade turns into silent CPU fallback (or a strict-mode error in tests).
+//!
+//! The subset is intentionally narrow and conservative: widening it is a
+//! deliberate, tested change, and every widening must survive the
+//! differential suite plus mutation testing of the support predicates.
+
+use std::sync::Arc;
+
+use polars_core::{
+    datatypes::{AnyValue, DataType},
+    frame::DataFrame,
+    schema::{Schema, SchemaRef},
+};
+use polars_cubecl_buffer::DType;
+#[cfg(feature = "parquet")]
+use polars_plan::dsl::ScanSource;
+use polars_plan::{
+    dsl::{FileScanIR, Operator, ScanSources, SinkTypeIR},
+    plans::{
+        AExpr, DynLiteralValue, FileInfo, IR, IRAggExpr, IRBooleanFunction, IRFunctionExpr,
+        LiteralValue, expr_ir::ExprIR,
+    },
+};
+#[cfg(feature = "parquet")]
+use polars_utils::pl_path::PlRefPath;
+use polars_utils::{
+    arena::{Arena, Node},
+    pl_str::PlSmallStr,
+};
+use thiserror::Error;
+
+/// Error returned when a plan cannot be lowered.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LowerError {
+    /// The plan (or part of it) is outside the supported subset.
+    #[error("unsupported plan shape: {reason}")]
+    Unsupported {
+        /// Human-readable reason, naming the node/expression that was rejected.
+        reason: String,
+    },
+}
+
+/// A scalar literal in the engine's subset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScalarLit {
+    /// 32-bit signed integer literal.
+    I32(i32),
+    /// 64-bit signed integer literal.
+    I64(i64),
+    /// 32-bit unsigned integer literal.
+    U32(u32),
+    /// 64-bit unsigned integer literal.
+    U64(u64),
+    /// 32-bit float literal.
+    F32(f32),
+    /// 64-bit float literal.
+    F64(f64),
+    /// Boolean literal.
+    Bool(bool),
+}
+
+/// Comparison operators supported by the predicate kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    /// Equal.
+    Eq,
+    /// Not equal.
+    NotEq,
+    /// Less than.
+    Lt,
+    /// Less than or equal.
+    LtEq,
+    /// Greater than.
+    Gt,
+    /// Greater than or equal.
+    GtEq,
+}
+
+impl CmpOp {
+    /// Flip the operator for `literal op column` shapes.
+    #[must_use]
+    pub const fn flip(self) -> Self {
+        match self {
+            Self::Eq | Self::NotEq => self,
+            Self::Lt => Self::Gt,
+            Self::LtEq => Self::GtEq,
+            Self::Gt => Self::Lt,
+            Self::GtEq => Self::LtEq,
+        }
+    }
+
+    /// Negate the operator for pushed-down `NOT` (`De Morgan` at the leaves).
+    #[must_use]
+    pub const fn negate(self) -> Self {
+        match self {
+            Self::Eq => Self::NotEq,
+            Self::NotEq => Self::Eq,
+            Self::Lt => Self::GtEq,
+            Self::LtEq => Self::Gt,
+            Self::Gt => Self::LtEq,
+            Self::GtEq => Self::Lt,
+        }
+    }
+}
+
+/// A filter predicate in the engine's subset, in negation normal form.
+///
+/// Every variant evaluates to a null-excluding mask: a null input never
+/// passes. `NOT` is pushed down to the leaves at lowering time (De Morgan),
+/// so no variant needs separate validity tracking: for filter purposes,
+/// Kleene `AND`/`OR` coincide with bitwise ops over null-excluding masks,
+/// and negated leaves (`NotCompare` via flipped operators, `NotColumn` via
+/// `!values & validity`) exclude nulls exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Predicate {
+    /// `column op literal`, evaluated in `kernel_dtype`.
+    ///
+    /// `kernel_dtype` equals the column dtype except for the single allowed
+    /// widening: `Int32`/`UInt32` columns compared against `f64` literals run
+    /// in `Float64` (the CPU engine widens the integer side to `f64`, which is
+    /// exact for 32-bit integers).
+    Compare {
+        /// Compared column.
+        column: PlSmallStr,
+        /// Dtype the comparison kernel runs in.
+        kernel_dtype: DType,
+        /// Comparison operator.
+        op: CmpOp,
+        /// Literal right-hand side, already validated against `kernel_dtype`.
+        literal: ScalarLit,
+    },
+    /// Bare boolean column used as a mask (nulls do not pass).
+    ColumnMask {
+        /// Mask column.
+        column: PlSmallStr,
+    },
+    /// Negated boolean column: `!values & validity` (nulls do not pass).
+    NotColumn {
+        /// Mask column.
+        column: PlSmallStr,
+    },
+    /// Logical conjunction.
+    And(Box<Self>, Box<Self>),
+    /// Logical disjunction.
+    Or(Box<Self>, Box<Self>),
+}
+
+/// A group-by aggregation in the engine's subset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Aggregation {
+    /// Sum; groups without valid values yield the zero identity.
+    Sum {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// Minimum; null for groups without valid values.
+    Min {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// Maximum; null for groups without valid values.
+    Max {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// Mean as `sum / count_valid` in `f64`; null for groups without valid values.
+    Mean {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// Count of valid (non-null) values.
+    Count {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// First value in group order, null when it is null.
+    First {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// Last value in group order, null when it is null.
+    Last {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// Number of rows in the group.
+    Len {
+        /// Output column name.
+        output: PlSmallStr,
+    },
+}
+
+/// One pipeline step of a [`CubePlan`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanOp {
+    /// Keep rows satisfying the predicate, preserving order.
+    Filter(Predicate),
+    /// Keep and reorder/rename columns: `(output_name, input_name)` pairs.
+    Project(Vec<(PlSmallStr, PlSmallStr)>),
+    /// Keep `len` rows starting at `offset` (negative counts from the end).
+    Slice {
+        /// Start offset; negative counts from the end.
+        offset: i64,
+        /// Number of rows.
+        len: u32,
+    },
+    /// Group rows by plain-column keys and aggregate.
+    GroupBy {
+        /// Key columns as `(output_name, input_name)` pairs, in output order.
+        keys: Vec<(PlSmallStr, PlSmallStr)>,
+        /// Aggregations, in output order.
+        aggs: Vec<Aggregation>,
+    },
+}
+
+/// The engine's plan: a source plus a linear pipeline of supported ops.
+#[derive(Clone, Debug)]
+pub struct CubePlan {
+    source: PlanSource,
+    ops: Vec<PlanOp>,
+}
+
+/// Plan inputs the engine can ingest.
+#[derive(Clone, Debug)]
+pub enum PlanSource {
+    /// In-memory frame plus the columns to read (projection already applied).
+    DataFrame {
+        /// Input frame.
+        frame: Arc<DataFrame>,
+        /// Columns to read, in order.
+        columns: Vec<PlSmallStr>,
+    },
+    /// Parquet file plus the columns to read (projection already applied).
+    Parquet {
+        /// File path.
+        path: String,
+        /// Columns to read, in order.
+        columns: Vec<PlSmallStr>,
+        /// Row-count estimate for the small-frame CPU policy (`usize::MAX`
+        /// when unknown).
+        height: usize,
+    },
+}
+
+impl CubePlan {
+    /// Plan source.
+    #[must_use]
+    pub const fn source(&self) -> &PlanSource {
+        &self.source
+    }
+
+    /// Pipeline steps in execution order.
+    #[must_use]
+    pub fn ops(&self) -> &[PlanOp] {
+        &self.ops
+    }
+
+    /// Row count of the plan source (used for the small-frame CPU policy).
+    #[must_use]
+    pub fn source_height(&self) -> usize {
+        match &self.source {
+            PlanSource::DataFrame { frame, .. } => frame.height(),
+            PlanSource::Parquet { height, .. } => *height,
+        }
+    }
+}
+
+/// Lower the optimized Polars IR at `root` into a [`CubePlan`].
+///
+/// Returns [`LowerError::Unsupported`] for anything outside the subset; the
+/// caller must leave the plan untouched in that case.
+pub fn lower(
+    root: Node,
+    lp_arena: &Arena<IR>,
+    expr_arena: &Arena<AExpr>,
+) -> Result<CubePlan, LowerError> {
+    let mut builder = Builder::new(expr_arena);
+    builder.lower_node(root, lp_arena)?;
+    builder.finish()
+}
+
+/// Child plan nodes of `node`, for hybrid top-down traversal.
+///
+/// Leaf sources (`DataFrameScan`, file `Scan`) and unknown shapes yield no
+/// children; the hybrid driver simply does not descend into them.
+#[must_use]
+pub fn child_nodes(node: Node, lp_arena: &Arena<IR>) -> Vec<Node> {
+    match lp_arena.get(node) {
+        IR::Sink { input, .. } |
+        IR::Filter { input, .. } |
+        IR::Slice { input, .. } |
+        IR::SimpleProjection { input, .. } |
+        IR::Select { input, .. } |
+        IR::Sort { input, .. } |
+        IR::Cache { input, .. } |
+        IR::GroupBy { input, .. } |
+        IR::HStack { input, .. } |
+        IR::Distinct { input, .. } |
+        IR::MapFunction { input, .. } => vec![*input],
+        IR::Gather { input, idxs, .. } => vec![*input, *idxs],
+        IR::Join { input_left, input_right, .. } => vec![*input_left, *input_right],
+        IR::Union { inputs, .. } |
+        IR::HConcat { inputs, .. } |
+        IR::SinkMultiple { inputs, .. } |
+        IR::UnoptimizedDispatch { inputs, .. } => inputs.clone(),
+        IR::ExtContext { input, contexts, .. } => {
+            let mut children = Vec::with_capacity(contexts.len() + 1);
+            children.push(*input);
+            children.extend(contexts.iter().copied());
+            children
+        }
+        IR::DataFrameScan { .. } | IR::Scan { .. } | IR::Invalid => Vec::new(),
+    }
+}
+
+struct Builder<'a> {
+    expr_arena: &'a Arena<AExpr>,
+    source: Option<PlanSource>,
+    ops: Vec<PlanOp>,
+    schema: Vec<(PlSmallStr, DataType)>,
+}
+
+impl<'a> Builder<'a> {
+    const fn new(expr_arena: &'a Arena<AExpr>) -> Self {
+        Self { expr_arena, source: None, ops: Vec::new(), schema: Vec::new() }
+    }
+
+    fn finish(self) -> Result<CubePlan, LowerError> {
+        let Some(source) = self.source else {
+            return Err(unsupported("plan has no readable source"));
+        };
+        Ok(CubePlan { source, ops: self.ops })
+    }
+
+    fn lower_node(&mut self, node: Node, lp_arena: &Arena<IR>) -> Result<(), LowerError> {
+        match lp_arena.get(node) {
+            IR::Sink { input, payload } => {
+                if !matches!(payload, SinkTypeIR::Memory) {
+                    return Err(unsupported("only memory sinks are supported"));
+                }
+                self.lower_node(*input, lp_arena)?;
+            }
+            IR::DataFrameScan { df, output_schema, .. } => {
+                self.lower_scan_source(df.clone(), output_schema.as_deref())?;
+            }
+            IR::Filter { input, predicate } => {
+                self.lower_node(*input, lp_arena)?;
+                let predicate = self.lower_predicate(predicate.node(), false)?;
+                self.ops.push(PlanOp::Filter(predicate));
+            }
+            IR::SimpleProjection { input, columns } => {
+                self.lower_node(*input, lp_arena)?;
+                let mut projection = Vec::new();
+                for name in columns.iter_names() {
+                    self.require_column(name)?;
+                    projection.push((name.clone(), name.clone()));
+                }
+                if projection.is_empty() {
+                    return Err(unsupported("empty projection"));
+                }
+                self.apply_projection(projection)?;
+            }
+            IR::Select { input, expr, .. } => {
+                self.lower_node(*input, lp_arena)?;
+                let mut projection = Vec::with_capacity(expr.len());
+                for item in expr {
+                    let output = output_name(item)?;
+                    let input_name = self.plain_column(item.node())?;
+                    projection.push((output, input_name));
+                }
+                if projection.is_empty() {
+                    return Err(unsupported("empty select"));
+                }
+                self.apply_projection(projection)?;
+            }
+            IR::Slice { input, offset, len } => {
+                self.lower_node(*input, lp_arena)?;
+                self.ops.push(PlanOp::Slice { offset: *offset, len: *len });
+            }
+            IR::GroupBy { input, keys, aggs, maintain_order, apply, .. } => {
+                if apply.is_some() {
+                    return Err(unsupported("group_by with python apply"));
+                }
+                if *maintain_order {
+                    return Err(unsupported("group_by with maintain_order"));
+                }
+                self.lower_node(*input, lp_arena)?;
+                let mut key_names = Vec::with_capacity(keys.len());
+                for key in keys {
+                    key_names.push((output_name(key)?, self.plain_column(key.node())?));
+                }
+                if key_names.is_empty() {
+                    return Err(unsupported("group_by without keys"));
+                }
+                let mut lowered = Vec::with_capacity(aggs.len());
+                for agg in aggs {
+                    lowered.push(self.lower_aggregation(agg)?);
+                }
+                if lowered.is_empty() {
+                    return Err(unsupported("group_by without aggregations"));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for (output, _) in &key_names {
+                    if !seen.insert(output) {
+                        return Err(unsupported("duplicate group_by key output"));
+                    }
+                }
+                for agg in &lowered {
+                    if !seen.insert(agg.output()) {
+                        return Err(unsupported("duplicate group_by output"));
+                    }
+                }
+                self.apply_group_by(key_names, lowered)?;
+            }
+            IR::Scan { sources, file_info, predicate, output_schema, scan_type, .. } => {
+                self.lower_scan(sources, file_info, predicate, output_schema, scan_type)?;
+            }
+            IR::Cache { .. } |
+            IR::Sort { .. } |
+            IR::Join { .. } |
+            IR::Gather { .. } |
+            IR::HStack { .. } |
+            IR::Distinct { .. } |
+            IR::MapFunction { .. } |
+            IR::Union { .. } |
+            IR::HConcat { .. } |
+            IR::ExtContext { .. } |
+            IR::SinkMultiple { .. } |
+            IR::UnoptimizedDispatch { .. } |
+            IR::Invalid => {
+                return Err(unsupported("node type outside the subset"));
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_scan_source(
+        &mut self,
+        frame: Arc<DataFrame>,
+        projected: Option<&Schema>,
+    ) -> Result<(), LowerError> {
+        if self.source.is_some() {
+            return Err(unsupported("multiple sources"));
+        }
+        let mut columns = Vec::new();
+        let mut schema = Vec::new();
+        match projected {
+            Some(projection) => {
+                for name in projection.iter_names() {
+                    let dtype = frame
+                        .column(name)
+                        .map_err(|_| unsupported("projected column missing from frame"))?
+                        .dtype()
+                        .clone();
+                    require_dtype(&dtype)?;
+                    columns.push(name.clone());
+                    schema.push((name.clone(), dtype));
+                }
+            }
+            None => {
+                for column in frame.columns() {
+                    let dtype = column.dtype().clone();
+                    require_dtype(&dtype)?;
+                    columns.push(column.name().clone());
+                    schema.push((column.name().clone(), dtype));
+                }
+            }
+        }
+        if columns.is_empty() {
+            return Err(unsupported("source without columns"));
+        }
+        self.schema = schema;
+        self.source = Some(PlanSource::DataFrame { frame, columns });
+        Ok(())
+    }
+
+    fn lower_scan(
+        &mut self,
+        sources: &ScanSources,
+        file_info: &FileInfo,
+        predicate: &Option<ExprIR>,
+        output_schema: &Option<SchemaRef>,
+        scan_type: &FileScanIR,
+    ) -> Result<(), LowerError> {
+        #[cfg(feature = "parquet")]
+        {
+            if !matches!(scan_type, FileScanIR::Parquet { .. }) {
+                return Err(unsupported("non-parquet file scan"));
+            }
+            let source = ScanSource::from_sources(sources.clone())
+                .map_err(|_| unsupported("multi-source scan"))?;
+            let ScanSource::Path(path) = source else {
+                return Err(unsupported("non-path scan source"));
+            };
+            self.lower_parquet_source(path, file_info, output_schema.as_ref())?;
+            if let Some(predicate) = predicate {
+                let predicate = self.lower_predicate(predicate.node(), false)?;
+                self.ops.push(PlanOp::Filter(predicate));
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "parquet"))]
+        {
+            // The parquet path above is the only one that mutates the
+            // builder; without the feature nothing does. The reborrow keeps
+            // the shared signature honest in both configurations.
+            let _ = &mut *self;
+            let _ = (sources, file_info, predicate, output_schema, scan_type);
+            Err(unsupported("file scan needs the parquet feature"))
+        }
+    }
+
+    #[cfg(feature = "parquet")]
+    fn lower_parquet_source(
+        &mut self,
+        path: PlRefPath,
+        file_info: &FileInfo,
+        projected: Option<&SchemaRef>,
+    ) -> Result<(), LowerError> {
+        if self.source.is_some() {
+            return Err(unsupported("multiple sources"));
+        }
+        let mut columns = Vec::new();
+        let mut schema = Vec::new();
+        match projected {
+            Some(projection) => {
+                for name in projection.iter_names() {
+                    let dtype = file_info
+                        .schema
+                        .get(name)
+                        .ok_or_else(|| unsupported("projected column missing from file"))?
+                        .clone();
+                    require_dtype(&dtype)?;
+                    columns.push(name.clone());
+                    schema.push((name.clone(), dtype));
+                }
+            }
+            None => {
+                for (name, dtype) in file_info.schema.iter() {
+                    require_dtype(dtype)?;
+                    columns.push(name.clone());
+                    schema.push((name.clone(), dtype.clone()));
+                }
+            }
+        }
+        if columns.is_empty() {
+            return Err(unsupported("source without columns"));
+        }
+        self.schema = schema;
+        self.source = Some(PlanSource::Parquet {
+            path: path.as_str().to_string(),
+            columns,
+            height: file_info.row_estimation.0.unwrap_or(usize::MAX),
+        });
+        Ok(())
+    }
+
+    fn require_column(&self, name: &PlSmallStr) -> Result<DataType, LowerError> {
+        self.schema
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, dtype)| dtype.clone())
+            .ok_or_else(|| unsupported("unknown column"))
+    }
+
+    fn plain_column(&self, node: Node) -> Result<PlSmallStr, LowerError> {
+        match self.expr_arena.get(node) {
+            AExpr::Column(name) => {
+                self.require_column(name)?;
+                Ok(name.clone())
+            }
+            _ => Err(unsupported("non-column expression where a column is required")),
+        }
+    }
+
+    fn apply_projection(
+        &mut self,
+        projection: Vec<(PlSmallStr, PlSmallStr)>,
+    ) -> Result<(), LowerError> {
+        let mut schema = Vec::with_capacity(projection.len());
+        let mut seen = std::collections::HashSet::new();
+        for (output, input) in &projection {
+            if !seen.insert(output) {
+                return Err(unsupported("duplicate output column in projection"));
+            }
+            let Some((_, dtype)) = self.schema.iter().find(|(name, _)| name == input) else {
+                return Err(unsupported("projection input missing from schema"));
+            };
+            schema.push((output.clone(), dtype.clone()));
+        }
+        self.schema = schema;
+        self.ops.push(PlanOp::Project(projection));
+        Ok(())
+    }
+
+    fn apply_group_by(
+        &mut self,
+        keys: Vec<(PlSmallStr, PlSmallStr)>,
+        aggs: Vec<Aggregation>,
+    ) -> Result<(), LowerError> {
+        let mut schema = Vec::with_capacity(keys.len() + aggs.len());
+        for (output, input) in &keys {
+            schema.push((output.clone(), self.require_column(input)?));
+        }
+        for agg in &aggs {
+            schema.push((agg.output().clone(), agg.dtype(self)?));
+        }
+        self.schema = schema;
+        self.ops.push(PlanOp::GroupBy { keys, aggs });
+        Ok(())
+    }
+
+    fn lower_aggregation(&self, agg: &ExprIR) -> Result<Aggregation, LowerError> {
+        let output = output_name(agg)?;
+        match self.expr_arena.get(agg.node()) {
+            AExpr::Agg(inner) => match inner {
+                IRAggExpr::Sum(input) => {
+                    let input = self.numeric_column(*input)?;
+                    Ok(Aggregation::Sum { input, output })
+                }
+                IRAggExpr::Min { input, propagate_nans } => {
+                    reject_nans(*propagate_nans)?;
+                    let input = self.numeric_column(*input)?;
+                    Ok(Aggregation::Min { input, output })
+                }
+                IRAggExpr::Max { input, propagate_nans } => {
+                    reject_nans(*propagate_nans)?;
+                    let input = self.numeric_column(*input)?;
+                    Ok(Aggregation::Max { input, output })
+                }
+                IRAggExpr::Mean(input) => {
+                    let input = self.numeric_column(*input)?;
+                    Ok(Aggregation::Mean { input, output })
+                }
+                IRAggExpr::Count { input, include_nulls } => {
+                    let input = self.plain_column(*input)?;
+                    if *include_nulls {
+                        Ok(Aggregation::Len { output })
+                    } else {
+                        Ok(Aggregation::Count { input, output })
+                    }
+                }
+                IRAggExpr::First(input) => {
+                    let input = self.supported_column(*input)?;
+                    Ok(Aggregation::First { input, output })
+                }
+                IRAggExpr::Last(input) => {
+                    let input = self.supported_column(*input)?;
+                    Ok(Aggregation::Last { input, output })
+                }
+                _ => Err(unsupported("aggregation outside the subset")),
+            },
+            AExpr::Len => Ok(Aggregation::Len { output }),
+            _ => Err(unsupported("non-aggregation expression in group_by")),
+        }
+    }
+
+    fn numeric_column(&self, node: Node) -> Result<PlSmallStr, LowerError> {
+        let name = self.plain_column(node)?;
+        let dtype = self.require_column(&name)?;
+        if DType::from_polars(&dtype).is_none() {
+            return Err(unsupported("aggregation over unsupported dtype"));
+        }
+        Ok(name)
+    }
+
+    fn supported_column(&self, node: Node) -> Result<PlSmallStr, LowerError> {
+        let name = self.plain_column(node)?;
+        let dtype = self.require_column(&name)?;
+        require_dtype(&dtype)?;
+        Ok(name)
+    }
+
+    /// Lower a predicate into negation normal form.
+    ///
+    /// `negated` tracks an odd number of enclosing `NOT`s (De Morgan): leaf
+    /// comparisons flip operators, `AND`/`OR` swap, and bare boolean columns
+    /// become [`Predicate::NotColumn`].
+    fn lower_predicate(&self, node: Node, negated: bool) -> Result<Predicate, LowerError> {
+        match self.expr_arena.get(node) {
+            AExpr::BinaryExpr { left, op, right } => match op {
+                Operator::Eq |
+                Operator::NotEq |
+                Operator::Lt |
+                Operator::LtEq |
+                Operator::Gt |
+                Operator::GtEq => self.lower_comparison(*left, *op, *right, negated),
+                Operator::And | Operator::LogicalAnd if !negated => Ok(Predicate::And(
+                    Box::new(self.lower_predicate(*left, false)?),
+                    Box::new(self.lower_predicate(*right, false)?),
+                )),
+                Operator::Or | Operator::LogicalOr if !negated => Ok(Predicate::Or(
+                    Box::new(self.lower_predicate(*left, false)?),
+                    Box::new(self.lower_predicate(*right, false)?),
+                )),
+                Operator::And | Operator::LogicalAnd => Ok(Predicate::Or(
+                    Box::new(self.lower_predicate(*left, true)?),
+                    Box::new(self.lower_predicate(*right, true)?),
+                )),
+                Operator::Or | Operator::LogicalOr => Ok(Predicate::And(
+                    Box::new(self.lower_predicate(*left, true)?),
+                    Box::new(self.lower_predicate(*right, true)?),
+                )),
+                _ => Err(unsupported("binary operator outside the subset")),
+            },
+            AExpr::Function { input, function, .. } => match function {
+                IRFunctionExpr::Boolean(IRBooleanFunction::Not) => {
+                    if input.len() != 1 {
+                        return Err(unsupported("not with multiple inputs"));
+                    }
+                    self.lower_predicate(input[0].node(), !negated)
+                }
+                _ => Err(unsupported("function outside the subset")),
+            },
+            AExpr::Column(name) => {
+                let dtype = self.require_column(name)?;
+                if dtype != DataType::Boolean {
+                    return Err(unsupported("non-boolean column as predicate"));
+                }
+                if negated {
+                    Ok(Predicate::NotColumn { column: name.clone() })
+                } else {
+                    Ok(Predicate::ColumnMask { column: name.clone() })
+                }
+            }
+            _ => Err(unsupported("predicate shape outside the subset")),
+        }
+    }
+
+    fn lower_comparison(
+        &self,
+        left: Node,
+        op: Operator,
+        right: Node,
+        negated: bool,
+    ) -> Result<Predicate, LowerError> {
+        let cmp = match op {
+            Operator::Eq => CmpOp::Eq,
+            Operator::NotEq => CmpOp::NotEq,
+            Operator::Lt => CmpOp::Lt,
+            Operator::LtEq => CmpOp::LtEq,
+            Operator::Gt => CmpOp::Gt,
+            Operator::GtEq => CmpOp::GtEq,
+            _ => return Err(unsupported("comparison operator outside the subset")),
+        };
+        let cmp = if negated { cmp.negate() } else { cmp };
+        if let Ok(predicate) = self.column_against_literal(left, cmp, right) {
+            return Ok(predicate);
+        }
+        self.column_against_literal(right, cmp.flip(), left)
+    }
+
+    /// Lower `column_node op literal_node`.
+    ///
+    /// The column side is either a plain column or an `f64` cast over an
+    /// `Int32`/`UInt32` column (the widening the CPU engine applies when one
+    /// side is a float literal).
+    fn column_against_literal(
+        &self,
+        column_node: Node,
+        op: CmpOp,
+        literal_node: Node,
+    ) -> Result<Predicate, LowerError> {
+        let (column, widened) = match self.expr_arena.get(column_node) {
+            AExpr::Column(name) => (name.clone(), None),
+            AExpr::Cast { expr, dtype, .. } => {
+                let AExpr::Column(name) = self.expr_arena.get(*expr) else {
+                    return Err(unsupported("cast of a non-column in comparison"));
+                };
+                if *dtype != DataType::Float64 {
+                    return Err(unsupported("cast to non-f64 in comparison"));
+                }
+                match self.require_column(name)? {
+                    DataType::Int32 | DataType::UInt32 => (name.clone(), Some(DType::F64)),
+                    _ => return Err(unsupported("widening cast of non-32-bit column")),
+                }
+            }
+            _ => return Err(unsupported("comparison without a column side")),
+        };
+        let column_dtype = self.require_column(&column)?;
+        let kernel_dtype = widened.unwrap_or(
+            DType::from_polars(&column_dtype)
+                .ok_or_else(|| unsupported("comparison over unsupported dtype"))?,
+        );
+        let literal = self.lower_literal(literal_node, &column_dtype, kernel_dtype)?;
+        Ok(Predicate::Compare { column, kernel_dtype, op, literal })
+    }
+
+    fn lower_literal(
+        &self,
+        node: Node,
+        column_dtype: &DataType,
+        kernel_dtype: DType,
+    ) -> Result<ScalarLit, LowerError> {
+        let AExpr::Literal(value) = self.expr_arena.get(node) else {
+            return Err(unsupported("comparison without a literal side"));
+        };
+        match value {
+            LiteralValue::Scalar(scalar) => {
+                scalar_against_dtype(scalar.value(), column_dtype, kernel_dtype)
+            }
+            LiteralValue::Dyn(DynLiteralValue::Int(raw)) => {
+                int_against_dtype(*raw, column_dtype, kernel_dtype)
+            }
+            LiteralValue::Dyn(DynLiteralValue::Float(raw)) => {
+                float_against_dtype(*raw, column_dtype, kernel_dtype)
+            }
+            _ => Err(unsupported("literal kind outside the subset")),
+        }
+    }
+}
+
+impl Aggregation {
+    const fn output(&self) -> &PlSmallStr {
+        match self {
+            Self::Sum { output, .. } |
+            Self::Min { output, .. } |
+            Self::Max { output, .. } |
+            Self::Mean { output, .. } |
+            Self::Count { output, .. } |
+            Self::First { output, .. } |
+            Self::Last { output, .. } |
+            Self::Len { output } => output,
+        }
+    }
+
+    fn dtype(&self, builder: &Builder<'_>) -> Result<DataType, LowerError> {
+        match self {
+            // Sums keep the input dtype (verified against the CPU oracle);
+            // min/max/first/last keep it too.
+            Self::Sum { input, .. } |
+            Self::Min { input, .. } |
+            Self::Max { input, .. } |
+            Self::First { input, .. } |
+            Self::Last { input, .. } => Ok(builder.require_column(input)?),
+            Self::Mean { .. } => Ok(DataType::Float64),
+            Self::Count { .. } | Self::Len { .. } => Ok(DataType::UInt32),
+        }
+    }
+}
+
+fn output_name(expr: &ExprIR) -> Result<PlSmallStr, LowerError> {
+    expr.output_name_inner()
+        .get()
+        .cloned()
+        .ok_or_else(|| unsupported("expression without an output name"))
+}
+
+fn require_dtype(dtype: &DataType) -> Result<(), LowerError> {
+    if DType::from_polars(dtype).is_none() {
+        return Err(unsupported(&format!("dtype {dtype:?} outside the subset")));
+    }
+    Ok(())
+}
+
+fn reject_nans(propagate_nans: bool) -> Result<(), LowerError> {
+    if propagate_nans {
+        return Err(unsupported("min/max with propagate_nans"));
+    }
+    Ok(())
+}
+
+/// Validate a materialized scalar literal against the comparison.
+///
+/// `column_dtype` is the polars dtype of the column; `kernel_dtype` is the
+/// dtype the comparison kernel runs in (equal except for the f64 widening).
+fn scalar_against_dtype(
+    value: &AnyValue<'_>,
+    column_dtype: &DataType,
+    kernel_dtype: DType,
+) -> Result<ScalarLit, LowerError> {
+    if kernel_dtype == DType::F64 && matches!(column_dtype, DataType::Int32 | DataType::UInt32) {
+        if let Some(raw) = any_value_as_f64(value) {
+            return Ok(ScalarLit::F64(raw));
+        }
+        return Err(unsupported("literal dtype incompatible with column dtype"));
+    }
+    match (value, column_dtype) {
+        (AnyValue::Int32(raw), DataType::Int32) => Ok(ScalarLit::I32(*raw)),
+        (AnyValue::Int64(raw), DataType::Int64) => Ok(ScalarLit::I64(*raw)),
+        (AnyValue::UInt32(raw), DataType::UInt32) => Ok(ScalarLit::U32(*raw)),
+        (AnyValue::UInt64(raw), DataType::UInt64) => Ok(ScalarLit::U64(*raw)),
+        (AnyValue::Float32(raw), DataType::Float32) => Ok(ScalarLit::F32(*raw)),
+        (AnyValue::Float64(raw), DataType::Float64) => Ok(ScalarLit::F64(*raw)),
+        (AnyValue::Boolean(raw), DataType::Boolean) => Ok(ScalarLit::Bool(*raw)),
+        (AnyValue::Int64(raw), DataType::Int32) => {
+            int_against_dtype(i128::from(*raw), column_dtype, kernel_dtype)
+        }
+        (AnyValue::Int32(raw), DataType::Int64) => Ok(ScalarLit::I64(i64::from(*raw))),
+        _ => Err(unsupported("literal dtype incompatible with column dtype")),
+    }
+}
+
+fn any_value_as_f64(value: &AnyValue<'_>) -> Option<f64> {
+    match value {
+        AnyValue::Int32(raw) => Some(f64::from(*raw)),
+        AnyValue::Int64(raw) => Some(*raw as f64),
+        AnyValue::UInt32(raw) => Some(f64::from(*raw)),
+        AnyValue::UInt64(raw) => Some(*raw as f64),
+        AnyValue::Float32(raw) => Some(f64::from(*raw)),
+        AnyValue::Float64(raw) => Some(*raw),
+        _ => None,
+    }
+}
+
+fn int_against_dtype(
+    raw: i128,
+    column_dtype: &DataType,
+    kernel_dtype: DType,
+) -> Result<ScalarLit, LowerError> {
+    match (column_dtype, kernel_dtype) {
+        (DataType::Int32, DType::I32) => Ok(ScalarLit::I32(
+            i32::try_from(raw).map_err(|_| unsupported("integer literal out of range"))?,
+        )),
+        (DataType::Int64, DType::I64) => Ok(ScalarLit::I64(
+            i64::try_from(raw).map_err(|_| unsupported("integer literal out of range"))?,
+        )),
+        (DataType::UInt32, DType::U32) => Ok(ScalarLit::U32(
+            u32::try_from(raw).map_err(|_| unsupported("integer literal out of range"))?,
+        )),
+        (DataType::UInt64, DType::U64) => Ok(ScalarLit::U64(
+            u64::try_from(raw).map_err(|_| unsupported("integer literal out of range"))?,
+        )),
+        (DataType::Float32, DType::F32) => {
+            let value = raw as f32;
+            if f32_is_exact_int(value, raw) {
+                Ok(ScalarLit::F32(value))
+            } else {
+                Err(unsupported("integer literal not exact in f32"))
+            }
+        }
+        (DataType::Float64, DType::F64) => {
+            let value = raw as f64;
+            if f64_is_exact_int(value, raw) {
+                Ok(ScalarLit::F64(value))
+            } else {
+                Err(unsupported("integer literal not exact in f64"))
+            }
+        }
+        _ => Err(unsupported("integer literal against incompatible column")),
+    }
+}
+
+fn float_against_dtype(
+    raw: f64,
+    column_dtype: &DataType,
+    kernel_dtype: DType,
+) -> Result<ScalarLit, LowerError> {
+    match (column_dtype, kernel_dtype) {
+        // i32/u32 convert to f64 exactly, so passing the literal through
+        // matches Polars; an f64 column passes through unchanged.
+        (DataType::Int32 | DataType::UInt32 | DataType::Float64, DType::F64) => {
+            Ok(ScalarLit::F64(raw))
+        }
+        (DataType::Int64 | DataType::UInt64, _) => {
+            Err(unsupported("float literal against 64-bit integer column"))
+        }
+        (DataType::Float32, DType::F32) => {
+            let value = raw as f32;
+            // Exact equality, not a tolerance: the question is whether the
+            // literal survives the f64 -> f32 narrowing bit for bit. A margin
+            // would accept literals Polars itself rejects.
+            #[expect(clippy::float_cmp, reason = "exact round-trip check, not an approximate one")]
+            let exact = f64::from(value) == raw;
+            if exact || (value.is_nan() && raw.is_nan()) {
+                Ok(ScalarLit::F32(value))
+            } else {
+                Err(unsupported("float literal not exact in f32"))
+            }
+        }
+        _ => Err(unsupported("float literal against incompatible column")),
+    }
+}
+
+const fn f32_is_exact_int(value: f32, raw: i128) -> bool {
+    value as i128 == raw && raw >= -16_777_216 && raw <= 16_777_216
+}
+
+const fn f64_is_exact_int(value: f64, raw: i128) -> bool {
+    value as i128 == raw && raw >= -9_007_199_254_740_992 && raw <= 9_007_199_254_740_992
+}
+
+fn unsupported(reason: &str) -> LowerError {
+    LowerError::Unsupported { reason: reason.to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int32(value: i32) -> AnyValue<'static> {
+        AnyValue::Int32(value)
+    }
+
+    #[test]
+    fn int_literal_exact_in_f32_is_accepted() {
+        assert_eq!(int_against_dtype(5, &DataType::Float32, DType::F32), Ok(ScalarLit::F32(5.0)));
+        assert_eq!(
+            int_against_dtype(-16_777_216, &DataType::Float32, DType::F32),
+            Ok(ScalarLit::F32(-16_777_216.0))
+        );
+    }
+
+    #[test]
+    fn int_literal_inexact_in_f32_is_rejected() {
+        // 2^24 + 1 has no exact f32 representation.
+        assert!(int_against_dtype(16_777_217, &DataType::Float32, DType::F32).is_err());
+        // 2^24 + 2 is exact but out of range: equality holds, the bound fails.
+        assert!(int_against_dtype(16_777_218, &DataType::Float32, DType::F32).is_err());
+        // Below the range with a failed equality: both conjuncts fail.
+        assert!(int_against_dtype(-16_777_217, &DataType::Float32, DType::F32).is_err());
+        assert!(int_against_dtype(i128::from(i64::MAX), &DataType::Float32, DType::F32).is_err());
+    }
+
+    #[test]
+    fn int_literal_exact_in_f64_is_accepted() {
+        assert_eq!(int_against_dtype(5, &DataType::Float64, DType::F64), Ok(ScalarLit::F64(5.0)));
+        assert_eq!(
+            int_against_dtype(9_007_199_254_740_992, &DataType::Float64, DType::F64),
+            Ok(ScalarLit::F64(9_007_199_254_740_992.0))
+        );
+    }
+
+    #[test]
+    fn int_literal_inexact_in_f64_is_rejected() {
+        // 2^53 + 1 has no exact f64 representation.
+        assert!(int_against_dtype(9_007_199_254_740_993, &DataType::Float64, DType::F64).is_err());
+        // 2^53 + 2 is exact but out of range.
+        assert!(int_against_dtype(9_007_199_254_740_994, &DataType::Float64, DType::F64).is_err());
+        // -(2^53 + 1) rounds up: equality fails while both bounds hold.
+        assert!(int_against_dtype(-9_007_199_254_740_993, &DataType::Float64, DType::F64).is_err());
+    }
+
+    #[test]
+    fn int_literal_range_checked_against_int_columns() {
+        assert_eq!(int_against_dtype(7, &DataType::Int32, DType::I32), Ok(ScalarLit::I32(7)));
+        assert_eq!(int_against_dtype(7, &DataType::Int64, DType::I64), Ok(ScalarLit::I64(7)));
+        assert_eq!(int_against_dtype(7, &DataType::UInt32, DType::U32), Ok(ScalarLit::U32(7)));
+        assert_eq!(int_against_dtype(7, &DataType::UInt64, DType::U64), Ok(ScalarLit::U64(7)));
+        assert!(int_against_dtype(i128::from(i32::MAX) + 1, &DataType::Int32, DType::I32).is_err());
+        assert!(int_against_dtype(-1, &DataType::UInt32, DType::U32).is_err());
+        assert!(int_against_dtype(3, &DataType::Boolean, DType::Bool).is_err());
+    }
+
+    #[test]
+    fn float_literal_exact_in_f32_is_accepted() {
+        assert_eq!(
+            float_against_dtype(0.5, &DataType::Float32, DType::F32),
+            Ok(ScalarLit::F32(0.5))
+        );
+    }
+
+    #[test]
+    fn float_literal_inexact_in_f32_is_rejected() {
+        // 0.1 narrows lossily; accepting it would compare a different value.
+        assert!(float_against_dtype(0.1, &DataType::Float32, DType::F32).is_err());
+    }
+
+    #[test]
+    fn float_nan_survives_f32_narrowing() {
+        let result = float_against_dtype(f64::NAN, &DataType::Float32, DType::F32);
+        assert!(matches!(result, Ok(ScalarLit::F32(value)) if value.is_nan()));
+    }
+
+    #[test]
+    fn float_literal_against_64_bit_int_column_is_rejected() {
+        assert!(float_against_dtype(1.0, &DataType::Int64, DType::I64).is_err());
+        assert!(float_against_dtype(1.0, &DataType::UInt64, DType::U64).is_err());
+        assert!(float_against_dtype(1.0, &DataType::Int64, DType::F64).is_err());
+        assert!(float_against_dtype(1.0, &DataType::UInt64, DType::F64).is_err());
+    }
+
+    #[test]
+    fn float_literal_passes_through_f64() {
+        assert_eq!(
+            float_against_dtype(0.1, &DataType::Float64, DType::F64),
+            Ok(ScalarLit::F64(0.1))
+        );
+        assert_eq!(float_against_dtype(3.0, &DataType::Int32, DType::F64), Ok(ScalarLit::F64(3.0)));
+        assert_eq!(
+            float_against_dtype(3.0, &DataType::UInt32, DType::F64),
+            Ok(ScalarLit::F64(3.0))
+        );
+    }
+
+    #[test]
+    fn scalar_literals_pass_through_matching_columns() {
+        assert_eq!(
+            scalar_against_dtype(&int32(4), &DataType::Int32, DType::I32),
+            Ok(ScalarLit::I32(4))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Int64(4), &DataType::Int64, DType::I64),
+            Ok(ScalarLit::I64(4))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::UInt32(4), &DataType::UInt32, DType::U32),
+            Ok(ScalarLit::U32(4))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::UInt64(4), &DataType::UInt64, DType::U64),
+            Ok(ScalarLit::U64(4))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Float32(0.5), &DataType::Float32, DType::F32),
+            Ok(ScalarLit::F32(0.5))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Boolean(true), &DataType::Boolean, DType::Bool),
+            Ok(ScalarLit::Bool(true))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Float64(1.5), &DataType::Float64, DType::F64),
+            Ok(ScalarLit::F64(1.5))
+        );
+    }
+
+    #[test]
+    fn scalar_int64_narrows_into_int32_column_in_range() {
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Int64(9), &DataType::Int32, DType::I32),
+            Ok(ScalarLit::I32(9))
+        );
+        assert!(
+            scalar_against_dtype(
+                &AnyValue::Int64(i64::from(i32::MAX) + 1),
+                &DataType::Int32,
+                DType::I32
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scalar_int32_widens_into_int64_column() {
+        assert_eq!(
+            scalar_against_dtype(&int32(-2), &DataType::Int64, DType::I64),
+            Ok(ScalarLit::I64(-2))
+        );
+    }
+
+    #[test]
+    fn scalar_mismatched_literal_is_rejected() {
+        assert!(scalar_against_dtype(&int32(1), &DataType::Boolean, DType::Bool).is_err());
+        assert!(
+            scalar_against_dtype(&AnyValue::String("x"), &DataType::String, DType::I32).is_err()
+        );
+    }
+
+    #[test]
+    fn scalar_widens_int_to_f64_kernel() {
+        assert_eq!(
+            scalar_against_dtype(&int32(8), &DataType::Int32, DType::F64),
+            Ok(ScalarLit::F64(8.0))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Int64(8), &DataType::Int32, DType::F64),
+            Ok(ScalarLit::F64(8.0))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::UInt32(3), &DataType::UInt32, DType::F64),
+            Ok(ScalarLit::F64(3.0))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::UInt64(3), &DataType::UInt32, DType::F64),
+            Ok(ScalarLit::F64(3.0))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Float32(0.5), &DataType::Int32, DType::F64),
+            Ok(ScalarLit::F64(0.5))
+        );
+        assert_eq!(
+            scalar_against_dtype(&AnyValue::Float64(0.5), &DataType::UInt32, DType::F64),
+            Ok(ScalarLit::F64(0.5))
+        );
+    }
+
+    #[test]
+    fn support_predicates_reject_outside_subset() {
+        assert!(require_dtype(&DataType::String).is_err());
+        assert!(require_dtype(&DataType::Int32).is_ok());
+        assert!(reject_nans(true).is_err());
+        assert!(reject_nans(false).is_ok());
+    }
+
+    #[test]
+    fn aggregation_output_names_its_alias() {
+        let agg = Aggregation::Sum {
+            input: PlSmallStr::from_static("v"),
+            output: PlSmallStr::from_static("s"),
+        };
+        assert_eq!(agg.output(), &PlSmallStr::from_static("s"));
+        let agg = Aggregation::Len { output: PlSmallStr::from_static("n") };
+        assert_eq!(agg.output(), &PlSmallStr::from_static("n"));
+    }
+}
+
+#[cfg(test)]
+mod predicate_tests {
+    use polars_core::{
+        prelude::{NamedFrom, Series},
+        scalar::Scalar,
+    };
+    use polars_plan::plans::expr_ir::ExprIR;
+
+    use super::*;
+
+    pub(crate) fn name(value: &str) -> PlSmallStr {
+        PlSmallStr::from(value)
+    }
+
+    #[test]
+    fn all_comparison_operators_lower() {
+        let cases = [
+            (Operator::Eq, CmpOp::Eq),
+            (Operator::NotEq, CmpOp::NotEq),
+            (Operator::Lt, CmpOp::Lt),
+            (Operator::LtEq, CmpOp::LtEq),
+            (Operator::Gt, CmpOp::Gt),
+            (Operator::GtEq, CmpOp::GtEq),
+        ];
+        for (op, expected) in cases {
+            let mut arena = Arena::new();
+            let left = arena.add(AExpr::Column(name("a")));
+            let right = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Int(4))));
+            let node = arena.add(AExpr::BinaryExpr { left, op, right });
+            let builder = pred_builder(&arena);
+            assert_eq!(
+                builder.lower_predicate(node, false),
+                Ok(Predicate::Compare {
+                    column: name("a"),
+                    kernel_dtype: DType::I32,
+                    op: expected,
+                    literal: ScalarLit::I32(4),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn and_or_lower_and_swap_under_negation() -> Result<(), LowerError> {
+        // `a == 1 AND flag`, then the same tree negated (De Morgan).
+        for negated in [false, true] {
+            let mut arena = Arena::new();
+            let column = arena.add(AExpr::Column(name("a")));
+            let literal = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Int(1))));
+            let cmp =
+                arena.add(AExpr::BinaryExpr { left: column, op: Operator::Eq, right: literal });
+            let mask = arena.add(AExpr::Column(name("flag")));
+            for op in [Operator::And, Operator::LogicalAnd, Operator::Or, Operator::LogicalOr] {
+                let node = arena.add(AExpr::BinaryExpr { left: cmp, op, right: mask });
+                let builder = pred_builder(&arena);
+                let predicate = builder.lower_predicate(node, negated)?;
+                // `AND` stays a conjunction unless negated; `OR` is the dual.
+                let is_conjunction = matches!(op, Operator::And | Operator::LogicalAnd) != negated;
+                if is_conjunction {
+                    assert!(matches!(predicate, Predicate::And(..)));
+                } else {
+                    assert!(matches!(predicate, Predicate::Or(..)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn not_flips_negation() {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("flag")));
+        let input = ExprIR::from_node(column, &arena);
+        let node = arena.add(AExpr::Function {
+            input: vec![input],
+            function: IRFunctionExpr::Boolean(IRBooleanFunction::Not),
+            options: Default::default(),
+        });
+        let builder = pred_builder(&arena);
+        assert_eq!(
+            builder.lower_predicate(node, false),
+            Ok(Predicate::NotColumn { column: name("flag") })
+        );
+        assert_eq!(
+            builder.lower_predicate(node, true),
+            Ok(Predicate::ColumnMask { column: name("flag") })
+        );
+    }
+
+    #[test]
+    fn bare_boolean_column_is_a_mask() {
+        let mut arena = Arena::new();
+        let node = arena.add(AExpr::Column(name("flag")));
+        let builder = pred_builder(&arena);
+        assert_eq!(
+            builder.lower_predicate(node, false),
+            Ok(Predicate::ColumnMask { column: name("flag") })
+        );
+    }
+
+    #[test]
+    fn non_boolean_column_as_predicate_is_rejected() {
+        let mut arena = Arena::new();
+        let node = arena.add(AExpr::Column(name("a")));
+        let builder = pred_builder(&arena);
+        assert!(builder.lower_predicate(node, false).is_err());
+    }
+
+    #[test]
+    fn non_comparison_binary_is_rejected() {
+        let mut arena = Arena::new();
+        let left = arena.add(AExpr::Column(name("a")));
+        let right = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Int(1))));
+        let node = arena.add(AExpr::BinaryExpr { left, op: Operator::Plus, right });
+        let builder = pred_builder(&arena);
+        assert!(builder.lower_predicate(node, false).is_err());
+    }
+
+    #[test]
+    fn widening_cast_comparison_runs_in_f64() {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("a")));
+        let cast = arena.add(AExpr::Cast {
+            expr: column,
+            dtype: DataType::Float64,
+            options: polars_core::chunked_array::cast::CastOptions::Strict,
+        });
+        let literal = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Float(1.5))));
+        let node = arena.add(AExpr::BinaryExpr { left: cast, op: Operator::Gt, right: literal });
+        let builder = pred_builder(&arena);
+        assert_eq!(
+            builder.lower_predicate(node, false),
+            Ok(Predicate::Compare {
+                column: name("a"),
+                kernel_dtype: DType::F64,
+                op: CmpOp::Gt,
+                literal: ScalarLit::F64(1.5),
+            })
+        );
+    }
+
+    #[test]
+    fn float_literal_against_int64_column_is_rejected_in_predicate() {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("big")));
+        let literal = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Float(1.0))));
+        let node = arena.add(AExpr::BinaryExpr { left: column, op: Operator::Eq, right: literal });
+        let builder = pred_builder(&arena);
+        assert!(builder.lower_predicate(node, false).is_err());
+    }
+
+    #[test]
+    fn scalar_literal_lowers_through() {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("a")));
+        let scalar = Scalar::new(DataType::Int32, AnyValue::Int32(4));
+        let literal = arena.add(AExpr::Literal(LiteralValue::Scalar(scalar)));
+        let node = arena.add(AExpr::BinaryExpr { left: column, op: Operator::Lt, right: literal });
+        let builder = pred_builder(&arena);
+        assert_eq!(
+            builder.lower_predicate(node, false),
+            Ok(Predicate::Compare {
+                column: name("a"),
+                kernel_dtype: DType::I32,
+                op: CmpOp::Lt,
+                literal: ScalarLit::I32(4),
+            })
+        );
+    }
+
+    #[test]
+    fn supported_column_accepts_subset_and_rejects_the_rest() {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("a")));
+        let missing = arena.add(AExpr::Column(name("nope")));
+        let stringy = arena.add(AExpr::Column(name("s")));
+        let builder = pred_builder(&arena);
+        assert_eq!(builder.supported_column(column), Ok(name("a")));
+        assert!(builder.supported_column(missing).is_err());
+        assert!(builder.supported_column(stringy).is_err());
+    }
+
+    #[test]
+    fn output_name_reads_column_names() {
+        let mut arena = Arena::new();
+        let node = arena.add(AExpr::Column(name("a")));
+        let expr = ExprIR::from_node(node, &arena);
+        assert_eq!(output_name(&expr), Ok(name("a")));
+    }
+
+    #[test]
+    fn source_height_reports_frame_rows() -> Result<(), LowerError> {
+        let frame =
+            DataFrame::new_infer_height(vec![Series::new("a".into(), &[1_i32, 2, 3]).into()])
+                .map_err(|error| unsupported(&error.to_string()))?;
+        let plan = CubePlan {
+            source: PlanSource::DataFrame { frame: Arc::new(frame), columns: vec![name("a")] },
+            ops: Vec::new(),
+        };
+        assert_eq!(plan.source_height(), 3);
+        assert!(plan.ops().is_empty(), "fresh plan carries no ops");
+        Ok(())
+    }
+
+    fn pred_builder(arena: &Arena<AExpr>) -> Builder<'_> {
+        let mut builder = Builder::new(arena);
+        builder.schema = vec![
+            (name("a"), DataType::Int32),
+            (name("f"), DataType::Float64),
+            (name("flag"), DataType::Boolean),
+            (name("big"), DataType::Int64),
+            (name("s"), DataType::String),
+        ];
+        builder
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use polars_core::prelude::{NamedFrom, Series};
+    use polars_plan::plans::expr_ir::OutputName;
+
+    use super::*;
+    use crate::predicate_tests::name;
+
+    pub(crate) fn plan_frame() -> DataFrame {
+        DataFrame::new_infer_height(vec![
+            Series::new("a".into(), &[1_i32, 2, 3]).into(),
+            Series::new("f".into(), &[Some(1.0_f64), None, Some(3.0)]).into(),
+            Series::new("flag".into(), &[Some(true), Some(false), None]).into(),
+        ])
+        .unwrap_or(DataFrame::empty_with_height(0))
+    }
+
+    pub(crate) fn scan_node(frame: DataFrame, lp_arena: &mut Arena<IR>) -> Node {
+        let schema = frame.schema().clone();
+        lp_arena.add(IR::DataFrameScan { df: Arc::new(frame), schema, output_schema: None })
+    }
+
+    fn compare_node(
+        expr_arena: &mut Arena<AExpr>,
+        column: &str,
+        op: Operator,
+        literal: LiteralValue,
+    ) -> Node {
+        let left = expr_arena.add(AExpr::Column(name(column)));
+        let right = expr_arena.add(AExpr::Literal(literal));
+        expr_arena.add(AExpr::BinaryExpr { left, op, right })
+    }
+
+    #[test]
+    fn filter_plan_lowers_end_to_end() -> Result<(), LowerError> {
+        let frame = plan_frame();
+        let mut expr_arena = Arena::new();
+        let predicate = compare_node(
+            &mut expr_arena,
+            "a",
+            Operator::Gt,
+            LiteralValue::Dyn(DynLiteralValue::Int(1)),
+        );
+        let mut lp_arena = Arena::new();
+        let scan = scan_node(frame, &mut lp_arena);
+        let filter = lp_arena
+            .add(IR::Filter { input: scan, predicate: ExprIR::from_node(predicate, &expr_arena) });
+        let plan = lower(filter, &lp_arena, &expr_arena)?;
+        assert_eq!(plan.source_height(), 3);
+        assert_eq!(plan.ops(), &[PlanOp::Filter(Predicate::Compare {
+            column: name("a"),
+            kernel_dtype: DType::I32,
+            op: CmpOp::Gt,
+            literal: ScalarLit::I32(1),
+        })]);
+        Ok(())
+    }
+
+    #[test]
+    fn child_nodes_reports_inputs() {
+        let frame = plan_frame();
+        let mut expr_arena = Arena::new();
+        let predicate = compare_node(
+            &mut expr_arena,
+            "a",
+            Operator::Eq,
+            LiteralValue::Dyn(DynLiteralValue::Int(2)),
+        );
+        let mut lp_arena = Arena::new();
+        let scan = scan_node(frame, &mut lp_arena);
+        assert!(child_nodes(scan, &lp_arena).is_empty(), "scan nodes have no children");
+        let filter = lp_arena
+            .add(IR::Filter { input: scan, predicate: ExprIR::from_node(predicate, &expr_arena) });
+        assert_eq!(child_nodes(filter, &lp_arena), vec![scan]);
+    }
+
+    #[test]
+    fn memory_sink_passes_through() -> Result<(), LowerError> {
+        let frame = plan_frame();
+        let expr_arena = Arena::new();
+        let mut lp_arena = Arena::new();
+        let scan = scan_node(frame, &mut lp_arena);
+        let sink = lp_arena.add(IR::Sink { input: scan, payload: SinkTypeIR::Memory });
+        let plan = lower(sink, &lp_arena, &expr_arena)?;
+        assert_eq!(plan.source_height(), 3);
+        assert!(plan.ops().is_empty(), "sink adds no ops");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_projection_rewrites_schema() -> Result<(), LowerError> {
+        let arena = Arena::new();
+        let mut builder = Builder::new(&arena);
+        builder.schema = vec![(name("a"), DataType::Int32), (name("f"), DataType::Float64)];
+        builder.apply_projection(vec![(name("x"), name("a")), (name("y"), name("f"))])?;
+        assert_eq!(builder.schema, vec![
+            (name("x"), DataType::Int32),
+            (name("y"), DataType::Float64)
+        ]);
+        assert_eq!(builder.ops, [PlanOp::Project(vec![
+            (name("x"), name("a")),
+            (name("y"), name("f"))
+        ])]);
+        // Duplicate outputs and unknown inputs are rejected, not silently kept.
+        assert!(
+            builder.apply_projection(vec![(name("x"), name("a")), (name("x"), name("f"))]).is_err()
+        );
+        assert!(builder.apply_projection(vec![(name("x"), name("nope"))]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_group_by_rewrites_schema() -> Result<(), LowerError> {
+        let arena = Arena::new();
+        let mut builder = Builder::new(&arena);
+        builder.schema = vec![(name("a"), DataType::Int32), (name("f"), DataType::Float64)];
+        let aggs = vec![Aggregation::Sum { input: name("f"), output: name("s") }];
+        builder.apply_group_by(vec![(name("a"), name("a"))], aggs)?;
+        assert_eq!(builder.schema, vec![
+            (name("a"), DataType::Int32),
+            (name("s"), DataType::Float64)
+        ]);
+        assert_eq!(builder.ops.len(), 1);
+        assert!(matches!(builder.ops[0], PlanOp::GroupBy { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn all_aggregation_shapes_lower() -> Result<(), LowerError> {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("f")));
+        // Every expression is built before the builder borrows the arena.
+        let shapes: Vec<(AExpr, Aggregation, PlSmallStr)> = vec![
+            (
+                AExpr::Agg(IRAggExpr::Sum(column)),
+                Aggregation::Sum { input: name("f"), output: name("s") },
+                name("s"),
+            ),
+            (
+                AExpr::Agg(IRAggExpr::Min { input: column, propagate_nans: false }),
+                Aggregation::Min { input: name("f"), output: name("s") },
+                name("s"),
+            ),
+            (
+                AExpr::Agg(IRAggExpr::Max { input: column, propagate_nans: false }),
+                Aggregation::Max { input: name("f"), output: name("s") },
+                name("s"),
+            ),
+            (
+                AExpr::Agg(IRAggExpr::Mean(column)),
+                Aggregation::Mean { input: name("f"), output: name("s") },
+                name("s"),
+            ),
+            (
+                AExpr::Agg(IRAggExpr::Count { input: column, include_nulls: false }),
+                Aggregation::Count { input: name("f"), output: name("s") },
+                name("s"),
+            ),
+            (
+                AExpr::Agg(IRAggExpr::Count { input: column, include_nulls: true }),
+                Aggregation::Len { output: name("s") },
+                name("s"),
+            ),
+            (
+                AExpr::Agg(IRAggExpr::First(column)),
+                Aggregation::First { input: name("f"), output: name("s") },
+                name("s"),
+            ),
+            (
+                AExpr::Agg(IRAggExpr::Last(column)),
+                Aggregation::Last { input: name("f"), output: name("s") },
+                name("s"),
+            ),
+            // `len()` counts rows without an input column.
+            (AExpr::Len, Aggregation::Len { output: name("n") }, name("n")),
+        ];
+        let mut accepted = Vec::with_capacity(shapes.len());
+        for (shape, expected, output) in shapes {
+            let node = arena.add(shape);
+            accepted.push((node, expected, output));
+        }
+        // NaN propagation and exotic aggregations stay on the CPU engine.
+        let mut rejected = Vec::with_capacity(2);
+        for shape in [
+            AExpr::Agg(IRAggExpr::Min { input: column, propagate_nans: true }),
+            AExpr::Agg(IRAggExpr::Median(column)),
+        ] {
+            rejected.push(arena.add(shape));
+        }
+        let builder = schema_builder(&arena);
+        for (node, expected, output) in accepted {
+            let expr = ExprIR::new(node, OutputName::ColumnLhs(output));
+            assert_eq!(builder.lower_aggregation(&expr)?, expected);
+        }
+        for node in rejected {
+            let expr = ExprIR::new(node, OutputName::ColumnLhs(name("s")));
+            assert!(builder.lower_aggregation(&expr).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn float_literal_against_64_bit_reports_its_reason() -> Result<(), LowerError> {
+        let Err(error) = float_against_dtype(1.0, &DataType::Int64, DType::I64) else {
+            return Err(unsupported("64-bit float literal unexpectedly lowered"));
+        };
+        assert!(
+            matches!(&error, LowerError::Unsupported { reason } if reason.contains("64-bit")),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    fn schema_builder(arena: &Arena<AExpr>) -> Builder<'_> {
+        let mut builder = Builder::new(arena);
+        builder.schema = vec![
+            (name("a"), DataType::Int32),
+            (name("f"), DataType::Float64),
+            (name("flag"), DataType::Boolean),
+        ];
+        builder
+    }
+}
+
+#[cfg(test)]
+mod group_plan_tests {
+    use polars_plan::{dsl::GroupbyOptions, plans::expr_ir::OutputName};
+
+    use super::*;
+    use crate::{
+        plan_tests::{plan_frame, scan_node},
+        predicate_tests::name,
+    };
+
+    fn group_node(
+        lp_arena: &mut Arena<IR>,
+        frame: DataFrame,
+        keys: Vec<ExprIR>,
+        aggs: Vec<ExprIR>,
+    ) -> Node {
+        let schema = frame.schema().clone();
+        let scan = scan_node(frame, lp_arena);
+        lp_arena.add(IR::GroupBy {
+            input: scan,
+            keys,
+            aggs,
+            schema,
+            maintain_order: false,
+            options: Arc::new(GroupbyOptions::default()),
+            apply: None,
+        })
+    }
+
+    fn sum_agg(expr_arena: &mut Arena<AExpr>, output: &str) -> ExprIR {
+        let column = expr_arena.add(AExpr::Column(name("f")));
+        let node = expr_arena.add(AExpr::Agg(IRAggExpr::Sum(column)));
+        ExprIR::new(node, OutputName::ColumnLhs(name(output)))
+    }
+
+    #[test]
+    fn group_by_plan_lowers_end_to_end() -> Result<(), LowerError> {
+        let mut expr_arena = Arena::new();
+        let key_col = expr_arena.add(AExpr::Column(name("a")));
+        let keys = vec![ExprIR::new(key_col, OutputName::ColumnLhs(name("a")))];
+        let aggs = vec![sum_agg(&mut expr_arena, "s")];
+        let mut lp_arena = Arena::new();
+        let group = group_node(&mut lp_arena, plan_frame(), keys, aggs);
+        let plan = lower(group, &lp_arena, &expr_arena)?;
+        assert_eq!(plan.ops(), &[PlanOp::GroupBy {
+            keys: vec![(name("a"), name("a"))],
+            aggs: vec![Aggregation::Sum { input: name("f"), output: name("s") }],
+        }]);
+        Ok(())
+    }
+
+    #[test]
+    fn group_by_rejects_duplicates_and_empty_parts() -> Result<(), LowerError> {
+        // Duplicate key outputs are rejected, not silently merged.
+        let mut expr_arena = Arena::new();
+        let key_col = expr_arena.add(AExpr::Column(name("a")));
+        let keys = vec![
+            ExprIR::new(key_col, OutputName::ColumnLhs(name("a"))),
+            ExprIR::new(key_col, OutputName::ColumnLhs(name("a"))),
+        ];
+        let aggs = vec![sum_agg(&mut expr_arena, "s")];
+        let mut lp_arena = Arena::new();
+        let group = group_node(&mut lp_arena, plan_frame(), keys, aggs);
+        assert!(lower(group, &lp_arena, &expr_arena).is_err());
+        // Duplicate aggregation outputs are rejected too.
+        let mut expr_arena = Arena::new();
+        let key_col = expr_arena.add(AExpr::Column(name("a")));
+        let keys = vec![ExprIR::new(key_col, OutputName::ColumnLhs(name("a")))];
+        let aggs = vec![sum_agg(&mut expr_arena, "s"), sum_agg(&mut expr_arena, "s")];
+        let mut lp_arena = Arena::new();
+        let group = group_node(&mut lp_arena, plan_frame(), keys, aggs);
+        assert!(lower(group, &lp_arena, &expr_arena).is_err());
+        // A group-by without keys or without aggregations is rejected.
+        let mut expr_arena = Arena::new();
+        let aggs = vec![sum_agg(&mut expr_arena, "s")];
+        let mut lp_arena = Arena::new();
+        let group = group_node(&mut lp_arena, plan_frame(), Vec::new(), aggs);
+        assert!(lower(group, &lp_arena, &expr_arena).is_err());
+        Ok(())
+    }
+}

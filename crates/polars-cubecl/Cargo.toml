@@ -1,0 +1,45 @@
+[package]
+name = "polars-cubecl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["polars-cubecl-runtime/cpu", "polars-cubecl-testing/cpu"]
+cuda = ["polars-cubecl-runtime/cuda", "polars-cubecl-testing/cuda"]
+hip = ["polars-cubecl-runtime/hip", "polars-cubecl-testing/hip"]
+metal = ["polars-cubecl-runtime/metal", "polars-cubecl-testing/metal"]
+metal-native = ["polars-cubecl-runtime/metal-native", "polars-cubecl-testing/metal-native"]
+vulkan = ["polars-cubecl-runtime/vulkan", "polars-cubecl-testing/vulkan"]
+parquet = ["polars-cubecl-lower/parquet", "polars-lazy/parquet", "polars-lazy/streaming"]
+
+[dependencies]
+bytemuck = { workspace = true }
+cubecl = { workspace = true }
+cubecl-runtime = { workspace = true }
+polars-core = { workspace = true }
+polars-cubecl-buffer = { path = "../polars-cubecl-buffer" }
+polars-cubecl-kernels = { path = "../polars-cubecl-kernels" }
+polars-cubecl-lower = { path = "../polars-cubecl-lower" }
+polars-cubecl-runtime = { path = "../polars-cubecl-runtime" }
+polars-error = { workspace = true }
+polars-lazy = { workspace = true }
+polars-plan = { workspace = true }
+polars-utils = { workspace = true }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+polars-cubecl-testing = { path = "../polars-cubecl-testing" }
+polars-io = { workspace = true, features = ["parquet"] }
+proptest = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "engine"
+harness = false

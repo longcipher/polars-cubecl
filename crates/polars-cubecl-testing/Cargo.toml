@@ -1,0 +1,27 @@
+[package]
+name = "polars-cubecl-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["polars-cubecl/cpu"]
+cuda = ["polars-cubecl/cuda"]
+hip = ["polars-cubecl/hip"]
+metal = ["polars-cubecl/metal"]
+metal-native = ["polars-cubecl/metal-native"]
+vulkan = ["polars-cubecl/vulkan"]
+parquet = ["polars-cubecl/parquet"]
+
+[dependencies]
+polars-arrow = { workspace = true }
+polars-core = { workspace = true }
+polars-cubecl = { path = "../polars-cubecl" }
+polars-lazy = { workspace = true }
+proptest = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

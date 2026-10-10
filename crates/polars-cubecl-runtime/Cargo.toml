@@ -1,0 +1,22 @@
+[package]
+name = "polars-cubecl-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["cubecl/cpu", "cubecl/std", "cubecl/stdlib"]
+cuda = ["cubecl/cuda", "cubecl/std", "cubecl/stdlib"]
+hip = ["cubecl/hip", "cubecl/std", "cubecl/stdlib"]
+metal = ["cubecl/metal", "cubecl/std", "cubecl/stdlib"]
+metal-native = ["cubecl/metal-native", "cubecl/std", "cubecl/stdlib"]
+vulkan = ["cubecl/vulkan", "cubecl/std", "cubecl/stdlib"]
+
+[dependencies]
+cubecl = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

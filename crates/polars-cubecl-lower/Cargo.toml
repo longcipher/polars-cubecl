@@ -1,0 +1,19 @@
+[package]
+name = "polars-cubecl-lower"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+parquet = ["polars-plan/parquet"]
+
+[dependencies]
+polars-core = { workspace = true }
+polars-cubecl-buffer = { path = "../polars-cubecl-buffer" }
+polars-plan = { workspace = true }
+polars-utils = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

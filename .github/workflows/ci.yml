@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-src
+          toolchain: nightly
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-shear,cargo-sort,typos-cli,rumdl,cargo-llvm-cov,cargo-nextest
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+
+      - run: just ci
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage/lcov.info
+          fail_ci_if_error: false

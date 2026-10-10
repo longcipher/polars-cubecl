@@ -1,0 +1,28 @@
+[package]
+name = "pcbe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["polars-cubecl/cpu"]
+cuda = ["polars-cubecl/cuda"]
+hip = ["polars-cubecl/hip"]
+metal = ["polars-cubecl/metal"]
+metal-native = ["polars-cubecl/metal-native"]
+vulkan = ["polars-cubecl/vulkan"]
+parquet = ["polars-cubecl/parquet"]
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+eyre = { workspace = true }
+polars-config = { workspace = true }
+polars-core = { workspace = true }
+polars-cubecl = { path = "../../crates/polars-cubecl" }
+polars-lazy = { workspace = true }
+polars-utils = { workspace = true }
+
+[lints]
+workspace = true

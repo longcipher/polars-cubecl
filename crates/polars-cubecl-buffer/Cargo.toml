@@ -1,0 +1,26 @@
+[package]
+name = "polars-cubecl-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["cubecl/cpu", "cubecl/std", "cubecl/stdlib"]
+
+[dependencies]
+bytemuck = { workspace = true }
+cubecl = { workspace = true }
+cubecl-runtime = { workspace = true }
+polars-arrow = { workspace = true }
+polars-buffer = { workspace = true }
+polars-core = { workspace = true }
+polars-error = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

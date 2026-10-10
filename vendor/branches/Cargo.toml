@@ -1,0 +1,29 @@
+# Vendored copy of `branches 0.4.6` with a minimal toolchain-compat fix (see
+# src/lib.rs). Upstream `branches` uses `core::intrinsics::abort`, removed
+# from recent nightlies; it arrives here via `turso` (cubecl's environment
+# persistence) when the `metal`/`vulkan` backends are enabled. This `[patch]`
+# entry applies to workspace builds only; see README for details.
+[package]
+edition = "2018"
+name = "branches"
+version = "0.4.6"
+authors = ["Khashayar Fereidani"]
+build = "build.rs"
+description = "Branch hinting prediction and control functions (vendored, toolchain fix)"
+license = "MIT"
+repository = "https://github.com/fereidani/branches"
+
+[features]
+default = [
+    "std",
+    "prefetch",
+]
+prefetch = []
+std = []
+
+[lib]
+name = "branches"
+path = "src/lib.rs"
+
+[build-dependencies.rustc_version]
+version = "0.4"

@@ -1,0 +1,14 @@
+[build]
+pipelining = true
+jobs = 10
+rustc-wrapper = "kache"
+
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+git-fetch-with-cli = true
+retry = 3
+
+[term]
+progress.when = "never"

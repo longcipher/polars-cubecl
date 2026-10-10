@@ -1,0 +1,54 @@
+# Mutation testing configuration for cargo-mutants.
+#
+# Scope (see `examine_globs`): the three crates that hold the parts of the
+# engine where a silent logic error would produce wrong numbers with no
+# runtime error — plan lowering, the host/device conversion boundary, and
+# backend selection. They are covered by fast, CPU-only tests (example-based
+# unit tests plus `proptest` invariants, including synthetic-IR tests for the
+# whole predicate/expression lowering pipeline), so mutants there are killed
+# or confirmed within seconds.
+#
+# `polars-cubecl-kernels` is excluded on purpose: its `#[cube]` bodies expand
+# into generated items that mutation cannot target reliably, and their
+# behavior is pinned by the differential suite instead (see
+# `docs/differential-testing.md`). `polars-cubecl` itself is pinned by that
+# same differential suite, which needs GPUs and is too slow per mutant.
+# Binary entry points (`fn main`) cannot be exercised by unit tests, so
+# their injected mutants would always survive.
+#
+# NOTE: do not add `test_package` here. In this cargo-mutants version it
+# *replaces* the mutated packages' own tests instead of adding to them,
+# which silently dropped all unit coverage (discovered empirically: mutants
+# proven killable by unit tests survived once `test_package` was set).
+examine_globs = [
+    "crates/polars-cubecl-lower/src/**",
+    "crates/polars-cubecl-buffer/src/**",
+    "crates/polars-cubecl-runtime/src/**",
+]
+exclude_globs = ["bin/*/src/**"]
+# Excluded with proof, not convenience:
+# - `DeviceColumn::is_empty`: exists only to satisfy
+#   `clippy::len_without_is_empty` on a public type; it has no callers, and
+#   its body (`self.len() == 0`) delegates to `len`, which the differential
+#   suite covers on every query.
+# - `replace && with ||` in `float_against_dtype`: `value` is `raw as f32`,
+#   and f64->f32 narrowing preserves NaN-ness both ways, so
+#   `value.is_nan() && raw.is_nan()` is equivalent to either disjunct and
+#   the `||` mutant is unkillable by any test.
+# - `lower_scan` / `lower_parquet_source` mutants: that code is compiled out
+#   unless the `parquet` feature is on, and this gate runs on default
+#   features, so the mutants sit in dead code. The behavior is covered by
+#   the `--all-features` differential suite (`scan` tests) instead.
+# - `RuntimeContext::default_device`: with only the `cpu` backend linked (this
+#   gate's configuration), `Device::default()` probes to the CPU device, so
+#   replacing the per-kind mapping with the default is unobservable. The
+#   mapping across backends is pinned by the differential suite instead: every
+#   test constructs each linked backend through `named` → `default_device`.
+exclude_re = [
+    "DeviceColumn::is_empty",
+    "replace && with \\|\\| in float_against_dtype",
+    "Builder<'a>::lower_scan",
+    "Builder<'a>::lower_parquet_source",
+    "RuntimeContext::default_device",
+]
+minimum_test_timeout = 20
