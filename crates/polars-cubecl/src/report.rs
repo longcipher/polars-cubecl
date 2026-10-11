@@ -11,6 +11,8 @@ pub enum Op {
     Slice,
     /// A group-by aggregation stage.
     GroupBy,
+    /// A sort stage.
+    Sort,
 }
 
 /// Report attached to every engine result.

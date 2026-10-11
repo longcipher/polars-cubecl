@@ -12,10 +12,10 @@
 use cubecl::prelude::Client;
 use polars_core::frame::DataFrame;
 use polars_cubecl_buffer::{
-    BufferError, DType, DeviceColumn, download_frame, series_to_host, upload,
+    BufferError, DType, DeviceColumn, download, download_frame, series_to_host, upload,
 };
-use polars_cubecl_kernels::{KernelError, launch_cast_i32_to_f64, launch_cast_u32_to_f64};
-use polars_cubecl_lower::{CmpOp, CubePlan, PlanOp, PlanSource, Predicate, ScalarLit};
+use polars_cubecl_kernels::{KernelError, launch_cast_i32_to_f64, launch_cast_u32_to_f64, BinOp as KernelBinOp, CmpOp as KernelCmpOp, UnaryOp as KernelUnaryOp};
+use polars_cubecl_lower::{BinOp, CmpOp, CubePlan, Expr, PlanOp, PlanSource, Predicate, ScalarLit, UnaryOp};
 use polars_cubecl_runtime::{RuntimeContext, supports_f64};
 use polars_utils::pl_str::PlSmallStr;
 use thiserror::Error;
@@ -64,7 +64,7 @@ pub fn execute_plan(
                 ops.push(crate::Op::Filter);
             }
             PlanOp::Project(projection) => {
-                columns = apply_project(columns, projection)?;
+                columns = apply_project(client, f64_ok, columns, projection)?;
                 ops.push(crate::Op::Project);
             }
             PlanOp::Slice { offset, len } => {
@@ -74,6 +74,10 @@ pub fn execute_plan(
             PlanOp::GroupBy { keys, aggs } => {
                 columns = groupby::apply(client, f64_ok, columns, keys, aggs)?;
                 ops.push(crate::Op::GroupBy);
+            }
+            PlanOp::Sort { by, descending, nulls_last, slice } => {
+                columns = apply_sort(client, columns, by, *descending, *nulls_last, *slice)?;
+                ops.push(crate::Op::Sort);
             }
         }
     }
@@ -151,23 +155,450 @@ pub(crate) fn create_slice(client: &Client, bytes: &[u8]) -> cubecl_runtime::ser
     client.create_from_slice(if bytes.is_empty() { &[0] } else { bytes })
 }
 
+/// Evaluate one projection: each output column is an [`Expr`] tree over the
+/// resident input columns. Trees are evaluated bottom-up; intermediate
+/// results stay resident between steps.
 fn apply_project(
+    client: &Client,
+    f64_ok: bool,
     columns: Vec<DeviceColumn>,
-    projection: &[(PlSmallStr, PlSmallStr)],
+    projection: &[(PlSmallStr, Expr)],
 ) -> Result<Vec<DeviceColumn>, ExecError> {
+    let height = height_of(&columns);
     let mut output = Vec::with_capacity(projection.len());
-    for (output_name, input_name) in projection {
-        let index = find_column(&columns, input_name)?;
-        let source = &columns[index];
+    for (output_name, expr) in projection {
+        let result = eval_expr(client, f64_ok, &columns, expr, height)?;
         output.push(DeviceColumn::from_handles(
             output_name.clone(),
-            source.dtype(),
-            source.values().clone(),
-            source.validity().clone(),
-            source.len(),
+            result.dtype(),
+            result.values().clone(),
+            result.validity().clone(),
+            result.len(),
         ));
     }
     Ok(output)
+}
+
+/// Recursively evaluate an [`Expr`] tree against the resident columns.
+fn eval_expr(
+    client: &Client,
+    f64_ok: bool,
+    columns: &[DeviceColumn],
+    expr: &Expr,
+    height: usize,
+) -> Result<DeviceColumn, ExecError> {
+    match expr {
+        Expr::Col(name) => {
+            let index = find_column(columns, name)?;
+            Ok(columns[index].clone())
+        }
+        Expr::Lit(lit) => eval_literal(client, *lit, height),
+        Expr::BinOp(op, left, right) => eval_binop(client, f64_ok, columns, *op, left, right, height),
+        Expr::Unary(op, inner) => eval_unary(client, f64_ok, columns, *op, inner, height),
+    }
+}
+
+/// Materialize a scalar literal into a full device column: every row holds
+/// the literal value, and the validity mask is all-valid.
+fn eval_literal(
+    client: &Client,
+    lit: ScalarLit,
+    height: usize,
+) -> Result<DeviceColumn, ExecError> {
+    let dtype = match lit {
+        ScalarLit::I32(_) => DType::I32,
+        ScalarLit::I64(_) => DType::I64,
+        ScalarLit::U32(_) => DType::U32,
+        ScalarLit::U64(_) => DType::U64,
+        ScalarLit::F32(_) => DType::F32,
+        ScalarLit::F64(_) => DType::F64,
+        ScalarLit::Bool(_) => DType::Bool,
+    };
+    // Build a host-side dense buffer of the scalar repeated `height` times,
+    // then upload it. This avoids needing a dedicated fill kernel.
+    let raw = scalar_to_bytes(lit);
+    let mut value_bytes = Vec::with_capacity(height.saturating_mul(raw.len()));
+    for _ in 0..height {
+        value_bytes.extend_from_slice(&raw);
+    }
+    let values = client.create_from_slice(if value_bytes.is_empty() {
+        &[0]
+    } else {
+        &value_bytes
+    });
+    let validity_bytes = vec![1_u8; height];
+    let validity = client.create_from_slice(if validity_bytes.is_empty() {
+        &[0]
+    } else {
+        &validity_bytes
+    });
+    Ok(DeviceColumn::from_handles(PlSmallStr::from_static(""), dtype, values, validity, height))
+}
+
+/// Encode a [`ScalarLit`] as little-endian bytes for host-side broadcast.
+fn scalar_to_bytes(lit: ScalarLit) -> Vec<u8> {
+    match lit {
+        ScalarLit::I32(v) => v.to_le_bytes().to_vec(),
+        ScalarLit::I64(v) => v.to_le_bytes().to_vec(),
+        ScalarLit::U32(v) => v.to_le_bytes().to_vec(),
+        ScalarLit::U64(v) => v.to_le_bytes().to_vec(),
+        ScalarLit::F32(v) => v.to_le_bytes().to_vec(),
+        ScalarLit::F64(v) => v.to_le_bytes().to_vec(),
+        ScalarLit::Bool(v) => vec![u8::from(v)],
+    }
+}
+
+/// Evaluate a binary operation on two (recursively evaluated) sub-expressions.
+fn eval_binop(
+    client: &Client,
+    f64_ok: bool,
+    columns: &[DeviceColumn],
+    op: BinOp,
+    left: &Expr,
+    right: &Expr,
+    height: usize,
+) -> Result<DeviceColumn, ExecError> {
+    let lhs = eval_expr(client, f64_ok, columns, left, height)?;
+    let rhs = eval_expr(client, f64_ok, columns, right, height)?;
+
+    // Comparisons always yield `Bool`.
+    if matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    ) {
+        return eval_col_cmp(client, f64_ok, &lhs, &rhs, cmp_op(op), height);
+    }
+
+    // Arithmetic: promote to the wider dtype.
+    let out_dtype = promote_dtype(lhs.dtype(), rhs.dtype())?;
+    if out_dtype == DType::F64 && !f64_ok {
+        return Err(ExecError::BackendUnsupported(
+            "f64 arithmetic needs double support".to_string(),
+        ));
+    }
+
+    let lhs = maybe_cast(client, &lhs, out_dtype)?;
+    let rhs = maybe_cast(client, &rhs, out_dtype)?;
+
+    let out = alloc(client, height.saturating_mul(dtype_size(out_dtype)));
+    let out_valid = alloc(client, height);
+    dispatch_binop(client, &lhs, &rhs, &out, &out_valid, height, kernel_binop(op), out_dtype)?;
+    Ok(DeviceColumn::from_handles(PlSmallStr::from_static(""), out_dtype, out, out_valid, height))
+}
+
+/// Evaluate a unary operation on a (recursively evaluated) sub-expression.
+fn eval_unary(
+    client: &Client,
+    f64_ok: bool,
+    columns: &[DeviceColumn],
+    op: UnaryOp,
+    inner: &Expr,
+    height: usize,
+) -> Result<DeviceColumn, ExecError> {
+    let input = eval_expr(client, f64_ok, columns, inner, height)?;
+    let dtype = input.dtype();
+
+    // Float-only math functions require float dtypes.
+    match op {
+        UnaryOp::Abs | UnaryOp::Ceil | UnaryOp::Floor | UnaryOp::Exp |
+        UnaryOp::Sqrt | UnaryOp::Log1p | UnaryOp::Sin | UnaryOp::Cos | UnaryOp::Sign => {
+            if !matches!(dtype, DType::F32 | DType::F64) {
+                return Err(ExecError::NotExecutable(format!(
+                    "{op:?} requires a float dtype, got {dtype:?}",
+                )));
+            }
+        }
+        UnaryOp::Negate => {}
+    }
+    if dtype == DType::F64 && !f64_ok {
+        return Err(ExecError::BackendUnsupported(
+            "f64 unary op needs double support".to_string(),
+        ));
+    }
+
+    let out = alloc(client, height.saturating_mul(dtype_size(dtype)));
+    let out_valid = alloc(client, height);
+    dispatch_unaryop(client, &input, &out, &out_valid, height, kernel_unary_op(op), dtype)?;
+    Ok(DeviceColumn::from_handles(PlSmallStr::from_static(""), dtype, out, out_valid, height))
+}
+
+/// Evaluate a column-vs-column comparison.
+fn eval_col_cmp(
+    client: &Client,
+    f64_ok: bool,
+    lhs: &DeviceColumn,
+    rhs: &DeviceColumn,
+    op: CmpOp,
+    height: usize,
+) -> Result<DeviceColumn, ExecError> {
+    let out_dtype = promote_dtype(lhs.dtype(), rhs.dtype())?;
+    if out_dtype == DType::F64 && !f64_ok {
+        return Err(ExecError::BackendUnsupported(
+            "f64 comparison needs double support".to_string(),
+        ));
+    }
+    let lhs = maybe_cast(client, lhs, out_dtype)?;
+    let rhs = maybe_cast(client, rhs, out_dtype)?;
+
+    let out = alloc(client, height);
+    let out_valid = alloc(client, height);
+    dispatch_col_cmp(client, &lhs, &rhs, &out, &out_valid, height, kernel_cmp_op(op), out_dtype)?;
+    Ok(DeviceColumn::from_handles(PlSmallStr::from_static(""), DType::Bool, out, out_valid, height))
+}
+
+// --- Kernel dispatch -----------------------------------------------------
+
+/// Dispatch a binary arithmetic kernel for `dtype`.
+fn dispatch_binop(
+    client: &Client,
+    lhs: &DeviceColumn,
+    rhs: &DeviceColumn,
+    out: &cubecl_runtime::server::Handle,
+    out_valid: &cubecl_runtime::server::Handle,
+    height: usize,
+    op: KernelBinOp,
+    dtype: DType,
+) -> Result<(), ExecError> {
+    match dtype {
+        DType::I32 => polars_cubecl_kernels::launch_binop::<i32>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::I64 => polars_cubecl_kernels::launch_binop::<i64>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::U32 => polars_cubecl_kernels::launch_binop::<u32>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::U64 => polars_cubecl_kernels::launch_binop::<u64>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::F32 => polars_cubecl_kernels::launch_binop_f32(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::F64 => polars_cubecl_kernels::launch_binop_f64(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::Bool => return Err(ExecError::NotExecutable(
+            "binary arithmetic on boolean not supported".to_string(),
+        )),
+    }
+    Ok(())
+}
+
+/// Dispatch a unary kernel for `dtype`.
+fn dispatch_unaryop(
+    client: &Client,
+    input: &DeviceColumn,
+    out: &cubecl_runtime::server::Handle,
+    out_valid: &cubecl_runtime::server::Handle,
+    height: usize,
+    op: KernelUnaryOp,
+    dtype: DType,
+) -> Result<(), ExecError> {
+    match dtype {
+        DType::I32 => polars_cubecl_kernels::launch_unaryop::<i32>(
+            client, input.values(), input.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::I64 => polars_cubecl_kernels::launch_unaryop::<i64>(
+            client, input.values(), input.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::U32 => polars_cubecl_kernels::launch_unaryop::<u32>(
+            client, input.values(), input.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::U64 => polars_cubecl_kernels::launch_unaryop::<u64>(
+            client, input.values(), input.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::F32 => polars_cubecl_kernels::launch_unaryop_f32(
+            client, input.values(), input.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::F64 => polars_cubecl_kernels::launch_unaryop_f64(
+            client, input.values(), input.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::Bool => return Err(ExecError::NotExecutable(
+            "unary ops on boolean not supported".to_string(),
+        )),
+    }
+    Ok(())
+}
+
+/// Dispatch a column-vs-column comparison kernel for `dtype`.
+fn dispatch_col_cmp(
+    client: &Client,
+    lhs: &DeviceColumn,
+    rhs: &DeviceColumn,
+    out: &cubecl_runtime::server::Handle,
+    out_valid: &cubecl_runtime::server::Handle,
+    height: usize,
+    op: KernelCmpOp,
+    dtype: DType,
+) -> Result<(), ExecError> {
+    match dtype {
+        DType::I32 => polars_cubecl_kernels::launch_col_cmp::<i32>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::I64 => polars_cubecl_kernels::launch_col_cmp::<i64>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::U32 => polars_cubecl_kernels::launch_col_cmp::<u32>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::U64 => polars_cubecl_kernels::launch_col_cmp::<u64>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::F32 => polars_cubecl_kernels::launch_col_cmp_f32(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::F64 => polars_cubecl_kernels::launch_col_cmp_f64(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+        DType::Bool => polars_cubecl_kernels::launch_col_cmp::<u8>(
+            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
+            out, out_valid, height, op,
+        )?,
+    }
+    Ok(())
+}
+
+// --- Type promotion ------------------------------------------------------
+
+/// Type promotion for the engine's subset over [`DType`]. Mirrors the
+/// `promote_binary` logic in the lower crate.
+fn promote_dtype(left: DType, right: DType) -> Result<DType, ExecError> {
+    if left == right {
+        return Ok(left);
+    }
+    if left == DType::F64 || right == DType::F64 {
+        return Ok(DType::F64);
+    }
+    if left == DType::F32 || right == DType::F32 {
+        return Ok(DType::F32);
+    }
+    let (lb, ls) = int_width(left)?;
+    let (rb, rs) = int_width(right)?;
+    if ls == rs {
+        return Ok(if lb >= rb { left } else { right });
+    }
+    // Mixed signedness widens to at least `I64`.
+    Ok(DType::I64)
+}
+
+fn int_width(dtype: DType) -> Result<(u32, bool), ExecError> {
+    match dtype {
+        DType::I32 => Ok((32, true)),
+        DType::I64 => Ok((64, true)),
+        DType::U32 => Ok((32, false)),
+        DType::U64 => Ok((64, false)),
+        _ => Err(ExecError::Inconsistent("non-integer operand in binary op".to_string())),
+    }
+}
+
+/// Cast `column` to `target` dtype. Only casts with an existing kernel are
+/// supported; everything else falls back to the caller.
+fn maybe_cast(
+    client: &Client,
+    column: &DeviceColumn,
+    target: DType,
+) -> Result<DeviceColumn, ExecError> {
+    if column.dtype() == target {
+        return Ok(column.clone());
+    }
+    match (column.dtype(), target) {
+        (DType::I32, DType::F64) => {
+            let out = alloc(client, column.len() * 8);
+            launch_cast_i32_to_f64(client, column.values(), &out, column.len())?;
+            Ok(DeviceColumn::from_handles(
+                column.name().clone(), target, out, column.validity().clone(), column.len(),
+            ))
+        }
+        (DType::U32, DType::F64) => {
+            let out = alloc(client, column.len() * 8);
+            launch_cast_u32_to_f64(client, column.values(), &out, column.len())?;
+            Ok(DeviceColumn::from_handles(
+                column.name().clone(), target, out, column.validity().clone(), column.len(),
+            ))
+        }
+        _ => Err(ExecError::Inconsistent(format!(
+            "unsupported cast from {:?} to {:?}",
+            column.dtype(),
+            target,
+        ))),
+    }
+}
+
+// --- Op mapping ----------------------------------------------------------
+
+/// Map a lower [`BinOp`] to a [`KernelBinOp`] for arithmetic dispatch.
+fn kernel_binop(op: BinOp) -> KernelBinOp {
+    match op {
+        BinOp::Add => KernelBinOp::Add,
+        BinOp::Sub => KernelBinOp::Sub,
+        BinOp::Mul => KernelBinOp::Mul,
+        BinOp::Div => KernelBinOp::Div,
+        BinOp::FloorDiv => KernelBinOp::FloorDiv,
+        BinOp::Mod => KernelBinOp::Mod,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+            unreachable!("comparison ops dispatched via eval_col_cmp")
+        }
+    }
+}
+
+/// Map a lower [`BinOp`] comparison to a [`CmpOp`] (lower enum).
+fn cmp_op(op: BinOp) -> CmpOp {
+    match op {
+        BinOp::Eq => CmpOp::Eq,
+        BinOp::NotEq => CmpOp::NotEq,
+        BinOp::Lt => CmpOp::Lt,
+        BinOp::LtEq => CmpOp::LtEq,
+        BinOp::Gt => CmpOp::Gt,
+        BinOp::GtEq => CmpOp::GtEq,
+        _ => unreachable!("cmp_op called on arithmetic op"),
+    }
+}
+
+/// Map a lower [`CmpOp`] to a [`KernelCmpOp`] (kernels enum).
+fn kernel_cmp_op(op: CmpOp) -> KernelCmpOp {
+    match op {
+        CmpOp::Eq => KernelCmpOp::Eq,
+        CmpOp::NotEq => KernelCmpOp::NotEq,
+        CmpOp::Lt => KernelCmpOp::Lt,
+        CmpOp::LtEq => KernelCmpOp::LtEq,
+        CmpOp::Gt => KernelCmpOp::Gt,
+        CmpOp::GtEq => KernelCmpOp::GtEq,
+    }
+}
+
+/// Map a lower [`UnaryOp`] to a [`KernelUnaryOp`] (kernels enum).
+fn kernel_unary_op(op: UnaryOp) -> KernelUnaryOp {
+    match op {
+        UnaryOp::Abs => KernelUnaryOp::Abs,
+        UnaryOp::Ceil => KernelUnaryOp::Ceil,
+        UnaryOp::Floor => KernelUnaryOp::Floor,
+        UnaryOp::Exp => KernelUnaryOp::Exp,
+        UnaryOp::Sqrt => KernelUnaryOp::Sqrt,
+        UnaryOp::Log1p => KernelUnaryOp::Log1p,
+        UnaryOp::Sin => KernelUnaryOp::Sin,
+        UnaryOp::Cos => KernelUnaryOp::Cos,
+        UnaryOp::Sign => KernelUnaryOp::Sign,
+        UnaryOp::Negate => KernelUnaryOp::Negate,
+    }
 }
 
 fn apply_slice(
@@ -224,6 +655,215 @@ fn apply_filter(
         ));
     }
     Ok(output)
+}
+
+/// Sort all columns by a single key column.
+///
+/// The engine downloads the key column, computes the sort permutation on the
+/// host, then scatters a gathered index to the device and reorders every
+/// column through the existing gather infrastructure. A trailing `(offset,
+/// len)` window is applied after sorting.
+fn apply_sort(
+    client: &Client,
+    columns: Vec<DeviceColumn>,
+    by: &PlSmallStr,
+    descending: bool,
+    nulls_last: bool,
+    slice: Option<(i64, usize)>,
+) -> Result<Vec<DeviceColumn>, ExecError> {
+    let height = height_of(&columns);
+    if height == 0 {
+        return Ok(columns);
+    }
+    let key = columns
+        .iter()
+        .find(|column| column.name() == by)
+        .ok_or_else(|| ExecError::Inconsistent(format!("sort key {by:?} missing from columns")))?;
+    let key_host = download(client, key)?;
+    // u32 permutation vector — the device gather kernel takes u32 indices.
+    let mut permutation: Vec<u32> = (0..height).map(|i| i as u32).collect();
+    sort_permutation(
+        key_host.values(),
+        key_host.validity(),
+        descending,
+        nulls_last,
+        &mut permutation,
+    );
+    let indices = client.create_from_slice(bytemuck::cast_slice(&permutation));
+    let mut output = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let values = gather_column(client, column, &indices, height)?;
+        let validity = gather_mask(client, column.validity(), column.len(), &indices, height)?;
+        output.push(DeviceColumn::from_handles(
+            column.name().clone(),
+            column.dtype(),
+            values,
+            validity,
+            height,
+        ));
+    }
+    if let Some((offset, len)) = slice {
+        output = apply_slice(client, output, offset, len as u32)?;
+    }
+    Ok(output)
+}
+
+/// In-place compute a (stable) permutation that sorts `values` according to
+/// the given key column and null policy. `permutation` is mutated into the
+/// sorted index vector.
+fn sort_permutation(
+    values: &polars_cubecl_buffer::HostValues,
+    validity: &[u8],
+    descending: bool,
+    nulls_last: bool,
+    permutation: &mut [u32],
+) {
+    // `Valid(idx)` vs `Null(idx)`: null ordering is decided first (nulls go
+    // last when `nulls_last`), then by the natural order of the value,
+    // optionally reversed when `descending`. The comparator is stable on
+    // equal keys, which is what Polars `sort` promises.
+    match values {
+        polars_cubecl_buffer::HostValues::I32(v) => {
+            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+        }
+        polars_cubecl_buffer::HostValues::I64(v) => {
+            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+        }
+        polars_cubecl_buffer::HostValues::U32(v) => {
+            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+        }
+        polars_cubecl_buffer::HostValues::U64(v) => {
+            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+        }
+        polars_cubecl_buffer::HostValues::F32(v) => {
+            permutation.sort_by(|a, b| compare_keys_f32(v, validity, *a as usize, *b as usize, descending, nulls_last));
+        }
+        polars_cubecl_buffer::HostValues::F64(v) => {
+            permutation.sort_by(|a, b| compare_keys_f64(v, validity, *a as usize, *b as usize, descending, nulls_last));
+        }
+        polars_cubecl_buffer::HostValues::Bool(v) => {
+            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+        }
+    }
+}
+
+/// Compare two rows `a` and `b` of a column of totally-ordered values.
+fn compare_keys<T: Ord>(
+    values: &[T],
+    validity: &[u8],
+    a: usize,
+    b: usize,
+    descending: bool,
+    nulls_last: bool,
+) -> std::cmp::Ordering {
+    let va = validity[a] != 0;
+    let vb = validity[b] != 0;
+    let base = match (va, vb) {
+        (true, true) => values[a].cmp(&values[b]),
+        (false, false) => std::cmp::Ordering::Equal,
+        (false, true) => {
+            if nulls_last {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        (true, false) => {
+            if nulls_last {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+    };
+    if descending {
+        base.reverse()
+    } else {
+        base
+    }
+}
+
+/// Float comparison that matches Polars' sort ordering: `NaN` sorts after
+/// every other value (and above `+inf`), regardless of the `descending` and
+/// `nulls_last` flags.
+fn compare_keys_f32(
+    values: &[f32],
+    validity: &[u8],
+    a: usize,
+    b: usize,
+    descending: bool,
+    nulls_last: bool,
+) -> std::cmp::Ordering {
+    compare_float_keys(values, validity, a, b, descending, nulls_last)
+}
+
+fn compare_keys_f64(
+    values: &[f64],
+    validity: &[u8],
+    a: usize,
+    b: usize,
+    descending: bool,
+    nulls_last: bool,
+) -> std::cmp::Ordering {
+    compare_float_keys(values, validity, a, b, descending, nulls_last)
+}
+
+fn compare_float_keys<T: Copy + PartialOrd>(
+    values: &[T],
+    validity: &[u8],
+    a: usize,
+    b: usize,
+    descending: bool,
+    nulls_last: bool,
+) -> std::cmp::Ordering
+where
+    f64: From<T>,
+{
+    let va = validity[a] != 0;
+    let vb = validity[b] != 0;
+    let base = match (va, vb) {
+        (true, true) => {
+            let fa = f64::from(values[a]);
+            let fb = f64::from(values[b]);
+            float_sort_ord(fa).cmp(&float_sort_ord(fb))
+        }
+        (false, false) => std::cmp::Ordering::Equal,
+        (false, true) => {
+            if nulls_last {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        (true, false) => {
+            if nulls_last {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+    };
+    if descending {
+        base.reverse()
+    } else {
+        base
+    }
+}
+
+/// Map an `f64` to a `u64` key that sorts in the same order as Polars'
+/// (finite values by sign+magnitude, `-0.0 == +0.0`, `NaN` last).
+fn float_sort_ord(value: f64) -> u64 {
+    if value.is_nan() {
+        return u64::MAX;
+    }
+    let bits = value.to_bits();
+    // Flip the sign bit and, for negatives, the rest of the bits as well
+    // (IEEE 754 trick to make the bit pattern sort as unsigned == float order).
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits ^ (1 << 63)
+    }
 }
 
 fn eval_predicate(

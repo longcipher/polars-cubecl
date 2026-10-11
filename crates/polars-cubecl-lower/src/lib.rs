@@ -18,6 +18,7 @@ use polars_core::{
     schema::{Schema, SchemaRef},
 };
 use polars_cubecl_buffer::DType;
+use polars_core::chunked_array::ops::sort::options::SortMultipleOptions;
 #[cfg(feature = "parquet")]
 use polars_plan::dsl::ScanSource;
 use polars_plan::{
@@ -72,6 +73,167 @@ pub enum ScalarLit {
     F64(f64),
     /// Boolean literal.
     Bool(bool),
+}
+
+impl ScalarLit {
+    /// The Polars [`DataType`] of this literal.
+    #[must_use]
+    pub fn to_polars(self) -> DataType {
+        match self {
+            Self::I32(_) => DataType::Int32,
+            Self::I64(_) => DataType::Int64,
+            Self::U32(_) => DataType::UInt32,
+            Self::U64(_) => DataType::UInt64,
+            Self::F32(_) => DataType::Float32,
+            Self::F64(_) => DataType::Float64,
+            Self::Bool(_) => DataType::Boolean,
+        }
+    }
+}
+
+/// Binary operators for elementwise column-to-column expressions.
+///
+/// These mirror Polars' `Operator` variants re-mapped onto the engine's
+/// type-safe kernel set. Both arithmetic and comparison operators are
+/// represented: comparisons appear here too because `select(a < b)` must
+/// produce a new boolean column, distinct from the filter predicate path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    /// `left + right`.
+    Add,
+    /// `left - right`.
+    Sub,
+    /// `left * right`.
+    Mul,
+    /// `left / right` (true division).
+    Div,
+    /// `left // right` (floor division).
+    FloorDiv,
+    /// `left % right` (modulus; remainder has the sign of the dividend).
+    Mod,
+    /// `left == right`.
+    Eq,
+    /// `left != right`.
+    NotEq,
+    /// `left < right`.
+    Lt,
+    /// `left <= right`.
+    LtEq,
+    /// `left > right`.
+    Gt,
+    /// `left >= right`.
+    GtEq,
+}
+
+impl BinOp {
+    /// Polars [`Operator`] variant that maps to this [`BinOp`], if any.
+    #[must_use]
+    pub fn from_polars(op: Operator) -> Option<Self> {
+        match op {
+            Operator::Plus => Some(Self::Add),
+            Operator::Minus => Some(Self::Sub),
+            Operator::Multiply => Some(Self::Mul),
+            Operator::RustDivide | Operator::TrueDivide => Some(Self::Div),
+            Operator::FloorDivide => Some(Self::FloorDiv),
+            Operator::Modulus => Some(Self::Mod),
+            Operator::Eq => Some(Self::Eq),
+            Operator::NotEq => Some(Self::NotEq),
+            Operator::Lt => Some(Self::Lt),
+            Operator::LtEq => Some(Self::LtEq),
+            Operator::Gt => Some(Self::Gt),
+            Operator::GtEq => Some(Self::GtEq),
+            _ => None,
+        }
+    }
+}
+
+/// Unary (single-argument) elementwise operators on a column.
+///
+/// These are the math functions Polars lowers to a `Function` node — never a
+/// binary op — and that run as a single elementwise kernel per column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `|x|` (absolute value).
+    Abs,
+    /// `⌈x⌉` (ceiling).
+    Ceil,
+    /// `⌊x⌋` (floor).
+    Floor,
+    /// `e^x` (exponential).
+    Exp,
+    /// `√x` (square root).
+    Sqrt,
+    /// `ln(1 + x)` (log1p).
+    Log1p,
+    /// `sin(x)`.
+    Sin,
+    /// `cos(x)`.
+    Cos,
+    /// `sign(x)` (`-1`, `0`, `+1` by sign, `NaN` stays `NaN`).
+    Sign,
+    /// `-x` (arithmetic negation).
+    Negate,
+}
+
+/// An elementwise column expression in the engine's subset.
+///
+/// Trees of these drive `select(a + b)`, `select(sin(a))`, and similar
+/// non-aggregate projections. Every leaf is either a plain column reference
+/// or a [`ScalarLit`]; every interior node is a [`BinOp`] or a [`UnaryOp`].
+///
+/// # Examples
+///
+/// ```
+/// use polars_cubecl_buffer::DType;
+/// use polars_cubecl_lower::{BinOp, Expr, UnaryOp};
+///
+/// // `sin(a + 1)`, where `a` is a plain column.
+/// let expr = Expr::Unary(
+///     UnaryOp::Sin,
+///     Box::new(Expr::BinOp(
+///         BinOp::Add,
+///         Box::new(Expr::col("a")),
+///         Box::new(Expr::lit_i32(1)),
+///     )),
+/// );
+/// assert!(matches!(expr, Expr::Unary(..)));
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub enum Expr {
+    /// A plain column reference.
+    Col(PlSmallStr),
+    /// A literal scalar value.
+    Lit(ScalarLit),
+    /// A binary operation between two sub-expressions.
+    BinOp(BinOp, Box<Self>, Box<Self>),
+    /// A unary operation on a sub-expression.
+    Unary(UnaryOp, Box<Self>),
+}
+
+impl Expr {
+    /// Build a plain-column reference.
+    #[must_use]
+    pub fn col(name: &str) -> Self {
+        Self::Col(PlSmallStr::from(name))
+    }
+
+    /// Build a literal `i32`.
+    #[must_use]
+    pub fn lit_i32(value: i32) -> Self {
+        Self::Lit(ScalarLit::I32(value))
+    }
+
+    /// Build a literal `f64`.
+    #[must_use]
+    pub fn lit_f64(value: f64) -> Self {
+        Self::Lit(ScalarLit::F64(value))
+    }
+
+    /// Build a literal `bool`.
+    #[must_use]
+    pub fn lit_bool(value: bool) -> Self {
+        Self::Lit(ScalarLit::Bool(value))
+    }
 }
 
 /// Comparison operators supported by the predicate kernels.
@@ -228,6 +390,38 @@ pub enum Aggregation {
         /// Output column name.
         output: PlSmallStr,
     },
+    /// Product; groups without valid values yield the identity `1`.
+    Product {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
+    /// Standard deviation as `sqrt(sum((x - mean)^2) / (n - ddof))` in `f64`.
+    Std {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+        /// Delta degrees of freedom.
+        ddof: u8,
+    },
+    /// Variance as `sum((x - mean)^2) / (n - ddof)` in `f64`.
+    Var {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+        /// Delta degrees of freedom.
+        ddof: u8,
+    },
+    /// Median; null for groups without valid values.
+    Median {
+        /// Aggregated column.
+        input: PlSmallStr,
+        /// Output column name.
+        output: PlSmallStr,
+    },
     /// Number of rows in the group.
     Len {
         /// Output column name.
@@ -240,14 +434,32 @@ pub enum Aggregation {
 pub enum PlanOp {
     /// Keep rows satisfying the predicate, preserving order.
     Filter(Predicate),
-    /// Keep and reorder/rename columns: `(output_name, input_name)` pairs.
-    Project(Vec<(PlSmallStr, PlSmallStr)>),
+    /// Produce new columns from elementwise expressions. Each entry pairs an
+    /// output name with an [`Expr`] tree; every input column referenced by
+    /// the `Expr` trees must exist in the schema preceding this op.
+    Project(Vec<(PlSmallStr, Expr)>),
     /// Keep `len` rows starting at `offset` (negative counts from the end).
     Slice {
         /// Start offset; negative counts from the end.
         offset: i64,
         /// Number of rows.
         len: u32,
+    },
+    /// Sort rows by a single column, optionally keeping a slice of the result.
+    ///
+    /// The engine sorts by downloading the sort column, computing the
+    /// permutation on the host, then gathering all columns on the device.
+    /// This keeps the device kernels simple and portable at the cost of a
+    /// host/device round-trip for the sort column.
+    Sort {
+        /// Column to sort by.
+        by: PlSmallStr,
+        /// Sort direction per key (single entry: applies to `by`).
+        descending: bool,
+        /// Where nulls land (single entry: applies to `by`).
+        nulls_last: bool,
+        /// Optional `(offset, len)` window into the sorted output.
+        slice: Option<(i64, usize)>,
     },
     /// Group rows by plain-column keys and aggregate.
     GroupBy {
@@ -398,7 +610,7 @@ impl<'a> Builder<'a> {
                 let mut projection = Vec::new();
                 for name in columns.iter_names() {
                     self.require_column(name)?;
-                    projection.push((name.clone(), name.clone()));
+                    projection.push((name.clone(), Expr::Col(name.clone())));
                 }
                 if projection.is_empty() {
                     return Err(unsupported("empty projection"));
@@ -410,8 +622,8 @@ impl<'a> Builder<'a> {
                 let mut projection = Vec::with_capacity(expr.len());
                 for item in expr {
                     let output = output_name(item)?;
-                    let input_name = self.plain_column(item.node())?;
-                    projection.push((output, input_name));
+                    let lowered_expr = self.lower_expr(item.node())?;
+                    projection.push((output, lowered_expr));
                 }
                 if projection.is_empty() {
                     return Err(unsupported("empty select"));
@@ -460,8 +672,27 @@ impl<'a> Builder<'a> {
             IR::Scan { sources, file_info, predicate, output_schema, scan_type, .. } => {
                 self.lower_scan(sources, file_info, predicate, output_schema, scan_type)?;
             }
-            IR::Cache { .. } |
-            IR::Sort { .. } |
+            IR::Cache { input, .. } => { self.lower_node(*input, lp_arena)?; }
+            IR::Sort { input, by_column, slice, sort_options } => {
+                self.lower_node(*input, lp_arena)?;
+                // Reject multi-column sort and `maintain_order` for now. Single-key
+                // sort covers the common path; the rest stays on the CPU engine.
+                if by_column.len() != 1 {
+                    return Err(unsupported("sort by multiple columns"));
+                }
+                let options: &SortMultipleOptions = sort_options;
+                if options.maintain_order {
+                    return Err(unsupported("sort with maintain_order"));
+                }
+                if options.limit.is_some() {
+                    return Err(unsupported("sort with limit"));
+                }
+                let by = self.plain_column(by_column[0].node())?;
+                let descending = options.descending.first().copied().unwrap_or(false);
+                let nulls_last = options.nulls_last.first().copied().unwrap_or(false);
+                let slice = slice.as_ref().map(|(offset, len, _)| (*offset, *len));
+                self.ops.push(PlanOp::Sort { by, descending, nulls_last, slice });
+            }
             IR::Join { .. } |
             IR::Gather { .. } |
             IR::HStack { .. } |
@@ -620,22 +851,154 @@ impl<'a> Builder<'a> {
 
     fn apply_projection(
         &mut self,
-        projection: Vec<(PlSmallStr, PlSmallStr)>,
+        projection: Vec<(PlSmallStr, Expr)>,
     ) -> Result<(), LowerError> {
         let mut schema = Vec::with_capacity(projection.len());
         let mut seen = std::collections::HashSet::new();
-        for (output, input) in &projection {
+        for (output, expr) in &projection {
             if !seen.insert(output) {
                 return Err(unsupported("duplicate output column in projection"));
             }
-            let Some((_, dtype)) = self.schema.iter().find(|(name, _)| name == input) else {
-                return Err(unsupported("projection input missing from schema"));
-            };
-            schema.push((output.clone(), dtype.clone()));
+            let dtype = self.expr_dtype(expr)?;
+            require_dtype(&dtype)?;
+            schema.push((output.clone(), dtype));
         }
         self.schema = schema;
         self.ops.push(PlanOp::Project(projection));
         Ok(())
+    }
+
+    /// Infer the Polars [`DataType`] of a lowered [`Expr`] given the current
+    /// schema. Mirrors Polars' type-promotion rules for the engine's subset.
+    fn expr_dtype(&self, expr: &Expr) -> Result<DataType, LowerError> {
+        match expr {
+            Expr::Col(name) => self.require_column(name),
+            Expr::Lit(lit) => Ok(lit.to_polars()),
+            Expr::BinOp(op, left, right) => {
+                let left_dtype = self.expr_dtype(left)?;
+                let right_dtype = self.expr_dtype(right)?;
+                // Comparison operators always yield `Boolean`.
+                if matches!(
+                    op,
+                    BinOp::Eq
+                        | BinOp::NotEq
+                        | BinOp::Lt
+                        | BinOp::LtEq
+                        | BinOp::Gt
+                        | BinOp::GtEq
+                ) {
+                    return Ok(DataType::Boolean);
+                }
+                promote_binary(left_dtype, right_dtype)
+            }
+            Expr::Unary(_, inner) => self.expr_dtype(inner),
+        }
+    }
+
+    /// Translate a Polars `AExpr` into the engine's [`Expr`] subset.
+    ///
+    /// Supports plain columns, literals, binary arithmetic/comparison, and
+    /// the unary math functions in [`UnaryOp`]. Anything else yields
+    /// [`LowerError::Unsupported`].
+    fn lower_expr(&self, node: Node) -> Result<Expr, LowerError> {
+        match self.expr_arena.get(node) {
+            AExpr::Column(name) => {
+                self.require_column(name)?;
+                Ok(Expr::Col(name.clone()))
+            }
+            AExpr::Literal(value) => {
+                let scalar = self.lower_literal_to_scalar(value)?;
+                Ok(Expr::Lit(scalar))
+            }
+            AExpr::BinaryExpr { left, op, right } => {
+                let bin_op = BinOp::from_polars(*op)
+                    .ok_or_else(|| unsupported("binary operator outside the subset"))?;
+                let left = self.lower_expr(*left)?;
+                let right = self.lower_expr(*right)?;
+                Ok(Expr::BinOp(bin_op, Box::new(left), Box::new(right)))
+            }
+            AExpr::Function { input, function, .. } => {
+                let op = match function {
+                    IRFunctionExpr::Negate => UnaryOp::Negate,
+                    IRFunctionExpr::Pow(f) => match f {
+                        polars_plan::plans::IRPowFunction::Sqrt => UnaryOp::Sqrt,
+                        _ => return Err(unsupported("pow function outside the subset")),
+                    },
+                    IRFunctionExpr::Abs => UnaryOp::Abs,
+                    IRFunctionExpr::Ceil => UnaryOp::Ceil,
+                    IRFunctionExpr::Floor => UnaryOp::Floor,
+                    IRFunctionExpr::Exp => UnaryOp::Exp,
+                    IRFunctionExpr::Log1p => UnaryOp::Log1p,
+                    IRFunctionExpr::Sign => UnaryOp::Sign,
+                    IRFunctionExpr::Trigonometry(f) => match f {
+                        polars_plan::plans::IRTrigonometricFunction::Sin => UnaryOp::Sin,
+                        polars_plan::plans::IRTrigonometricFunction::Cos => UnaryOp::Cos,
+                        _ => return Err(unsupported("trig function outside the subset")),
+                    },
+                    _ => return Err(unsupported("function outside the subset")),
+                };
+                if input.len() != 1 {
+                    return Err(unsupported("unary function with multiple inputs"));
+                }
+                let inner = self.lower_expr(input[0].node())?;
+                // Float-only math ops (abs, ceil, floor, exp, sqrt, log1p,
+                // sin, cos, sign) have no integer kernel — reject at lowering
+                // so the engine cleanly falls back to the CPU.
+                if matches!(
+                    op,
+                    UnaryOp::Abs
+                        | UnaryOp::Ceil
+                        | UnaryOp::Floor
+                        | UnaryOp::Exp
+                        | UnaryOp::Sqrt
+                        | UnaryOp::Log1p
+                        | UnaryOp::Sin
+                        | UnaryOp::Cos
+                        | UnaryOp::Sign
+                ) && !matches!(
+                    self.expr_dtype(&inner)?,
+                    DataType::Float32 | DataType::Float64
+                ) {
+                    return Err(unsupported("float-only math op on non-float column"));
+                }
+                Ok(Expr::Unary(op, Box::new(inner)))
+            }
+            AExpr::Cast { expr, dtype, .. } => {
+                // Only allow identity-style casts (no-op) inside
+                // expressions; real casts should fall back to CPU.
+                let inner = self.lower_expr(*expr)?;
+                let inner_dtype = self.expr_dtype(&inner)?;
+                if &inner_dtype == dtype {
+                    Ok(inner)
+                } else {
+                    Err(unsupported("non-identity cast in expression"))
+                }
+            }
+            _ => Err(unsupported("expression shape outside the subset")),
+        }
+    }
+
+    /// Translate a Polars [`LiteralValue`] into a [`ScalarLit`].
+    fn lower_literal_to_scalar(&self, value: &LiteralValue) -> Result<ScalarLit, LowerError> {
+        match value {
+            LiteralValue::Scalar(scalar) => match scalar.value() {
+                AnyValue::Int32(raw) => Ok(ScalarLit::I32(*raw)),
+                AnyValue::Int64(raw) => Ok(ScalarLit::I64(*raw)),
+                AnyValue::UInt32(raw) => Ok(ScalarLit::U32(*raw)),
+                AnyValue::UInt64(raw) => Ok(ScalarLit::U64(*raw)),
+                AnyValue::Float32(raw) => Ok(ScalarLit::F32(*raw)),
+                AnyValue::Float64(raw) => Ok(ScalarLit::F64(*raw)),
+                AnyValue::Boolean(raw) => Ok(ScalarLit::Bool(*raw)),
+                _ => Err(unsupported("literal kind outside the subset")),
+            },
+            LiteralValue::Dyn(DynLiteralValue::Int(raw)) => {
+                i32::try_from(*raw)
+                    .map(ScalarLit::I32)
+                    .map_err(|_| unsupported("integer literal out of i32 range"))
+            }
+            LiteralValue::Dyn(DynLiteralValue::Float(raw)) => Ok(ScalarLit::F64(*raw)),
+            _ => Err(unsupported("literal kind outside the subset")),
+        }
     }
 
     fn apply_group_by(
@@ -693,7 +1056,29 @@ impl<'a> Builder<'a> {
                     let input = self.supported_column(*input)?;
                     Ok(Aggregation::Last { input, output })
                 }
+                IRAggExpr::Std(input, ddof) => {
+                    let input = self.numeric_column(*input)?;
+                    Ok(Aggregation::Std { input, output, ddof: *ddof })
+                }
+                IRAggExpr::Var(input, ddof) => {
+                    let input = self.numeric_column(*input)?;
+                    Ok(Aggregation::Var { input, output, ddof: *ddof })
+                }
+                IRAggExpr::Median(input) => {
+                    let input = self.numeric_column(*input)?;
+                    Ok(Aggregation::Median { input, output })
+                }
                 _ => Err(unsupported("aggregation outside the subset")),
+            },
+            AExpr::Function { input, function, .. } => match function {
+                IRFunctionExpr::Product => {
+                    if input.len() != 1 {
+                        return Err(unsupported("product with multiple inputs"));
+                    }
+                    let input_col = self.numeric_column(input[0].node())?;
+                    Ok(Aggregation::Product { input: input_col, output })
+                }
+                _ => Err(unsupported("function outside the subset")),
             },
             AExpr::Len => Ok(Aggregation::Len { output }),
             _ => Err(unsupported("non-aggregation expression in group_by")),
@@ -865,20 +1250,27 @@ impl Aggregation {
             Self::Count { output, .. } |
             Self::First { output, .. } |
             Self::Last { output, .. } |
+            Self::Product { output, .. } |
+            Self::Std { output, .. } |
+            Self::Var { output, .. } |
+            Self::Median { output, .. } |
             Self::Len { output } => output,
         }
     }
 
     fn dtype(&self, builder: &Builder<'_>) -> Result<DataType, LowerError> {
         match self {
-            // Sums keep the input dtype (verified against the CPU oracle);
-            // min/max/first/last keep it too.
+            // Sum/min/max/first/last/product keep the input dtype (verified
+            // against the CPU oracle).
             Self::Sum { input, .. } |
             Self::Min { input, .. } |
             Self::Max { input, .. } |
             Self::First { input, .. } |
-            Self::Last { input, .. } => Ok(builder.require_column(input)?),
-            Self::Mean { .. } => Ok(DataType::Float64),
+            Self::Last { input, .. } |
+            Self::Product { input, .. } |
+            Self::Median { input, .. } => Ok(builder.require_column(input)?),
+            // Mean/std/var widen to `f64`.
+            Self::Mean { .. } | Self::Std { .. } | Self::Var { .. } => Ok(DataType::Float64),
             Self::Count { .. } | Self::Len { .. } => Ok(DataType::UInt32),
         }
     }
@@ -945,6 +1337,60 @@ fn any_value_as_f64(value: &AnyValue<'_>) -> Option<f64> {
         AnyValue::Float32(raw) => Some(f64::from(*raw)),
         AnyValue::Float64(raw) => Some(*raw),
         _ => None,
+    }
+}
+
+/// Polars-style type promotion for a binary arithmetic/algebraic operation.
+///
+/// For the engine's subset the rules reduce to: `Float64` absorbs everything,
+/// `Float32` absorbs all integers, wider integers absorb narrower ones of the
+/// same sign class, and mixed signedness widens to the next signed width.
+fn promote_binary(left: DataType, right: DataType) -> Result<DataType, LowerError> {
+    use DataType::*;
+    if left == right {
+        return Ok(left);
+    }
+    // Float64 absorbs all.
+    if left == Float64 || right == Float64 {
+        return Ok(Float64);
+    }
+    // Float32 absorbs integers.
+    if left == Float32 || right == Float32 {
+        return Ok(Float32);
+    }
+    // Both integers: widen to the wider of the two, preferring signed.
+    let (lbits, l_signed) = int_width_signed(&left)?;
+    let (rbits, r_signed) = int_width_signed(&right)?;
+    if l_signed && r_signed {
+        return Ok(if lbits >= rbits { left } else { right });
+    }
+    if !l_signed && !r_signed {
+        return Ok(if lbits >= rbits { left } else { right });
+    }
+    // Mixed signedness: promote to the wider, preferring signed if equal.
+    let max_bits = lbits.max(rbits);
+    let promoted = if max_bits >= 64 {
+        Int64
+    } else if max_bits >= 32 {
+        if lbits == 32 && rbits == 32 {
+            // 32-bit signed + 32-bit unsigned -> Int64.
+            Int64
+        } else {
+            Int64
+        }
+    } else {
+        Int32
+    };
+    Ok(promoted)
+}
+
+fn int_width_signed(dtype: &DataType) -> Result<(u32, bool), LowerError> {
+    match dtype {
+        DataType::Int32 => Ok((32, true)),
+        DataType::Int64 => Ok((64, true)),
+        DataType::UInt32 => Ok((32, false)),
+        DataType::UInt64 => Ok((64, false)),
+        _ => Err(unsupported("non-integer operand in binary op")),
     }
 }
 
@@ -1758,20 +2204,26 @@ mod plan_tests {
         let arena = Arena::new();
         let mut builder = Builder::new(&arena);
         builder.schema = vec![(name("a"), DataType::Int32), (name("f"), DataType::Float64)];
-        builder.apply_projection(vec![(name("x"), name("a")), (name("y"), name("f"))])?;
+        builder.apply_projection(vec![
+            (name("x"), Expr::Col(name("a"))),
+            (name("y"), Expr::Col(name("f"))),
+        ])?;
         assert_eq!(builder.schema, vec![
             (name("x"), DataType::Int32),
             (name("y"), DataType::Float64)
         ]);
         assert_eq!(builder.ops, [PlanOp::Project(vec![
-            (name("x"), name("a")),
-            (name("y"), name("f"))
+            (name("x"), Expr::Col(name("a"))),
+            (name("y"), Expr::Col(name("f"))),
         ])]);
         // Duplicate outputs and unknown inputs are rejected, not silently kept.
-        assert!(
-            builder.apply_projection(vec![(name("x"), name("a")), (name("x"), name("f"))]).is_err()
-        );
-        assert!(builder.apply_projection(vec![(name("x"), name("nope"))]).is_err());
+        assert!(builder
+            .apply_projection(vec![
+                (name("x"), Expr::Col(name("a"))),
+                (name("x"), Expr::Col(name("f"))),
+            ])
+            .is_err());
+        assert!(builder.apply_projection(vec![(name("x"), Expr::Col(name("nope")))]).is_err());
         Ok(())
     }
 
@@ -1845,12 +2297,9 @@ mod plan_tests {
             let node = arena.add(shape);
             accepted.push((node, expected, output));
         }
-        // NaN propagation and exotic aggregations stay on the CPU engine.
-        let mut rejected = Vec::with_capacity(2);
-        for shape in [
-            AExpr::Agg(IRAggExpr::Min { input: column, propagate_nans: true }),
-            AExpr::Agg(IRAggExpr::Median(column)),
-        ] {
+        // NaN propagation stays on the CPU engine; Median now lowers.
+        let mut rejected = Vec::with_capacity(1);
+        for shape in [AExpr::Agg(IRAggExpr::Min { input: column, propagate_nans: true })] {
             rejected.push(arena.add(shape));
         }
         let builder = schema_builder(&arena);
@@ -1993,5 +2442,213 @@ mod group_plan_tests {
         let group = group_node(&mut lp_arena, plan_frame(), Vec::new(), aggs);
         assert!(lower(group, &lp_arena, &expr_arena).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod math_fn_tests {
+    use super::*;
+    use crate::predicate_tests::name;
+
+    /// Helper to lower a unary `IRFunctionExpr` against a schema where `f` is
+    /// `Float64` and `i` is `Int32`, returning the resulting `Expr`.
+    fn lower_unary(
+        arena: &mut Arena<AExpr>,
+        function: IRFunctionExpr,
+        column: &str,
+    ) -> Result<Expr, LowerError> {
+        let col = arena.add(AExpr::Column(name(column)));
+        let input = ExprIR::from_node(col, arena);
+        let node = arena.add(AExpr::Function {
+            input: vec![input],
+            function,
+            options: Default::default(),
+        });
+        let mut builder = Builder::new(arena);
+        builder.schema = vec![(name("f"), DataType::Float64), (name("i"), DataType::Int32)];
+        builder.lower_expr(node)
+    }
+
+    /// Lower and unwrap with a clear panic message on failure.
+    #[expect(clippy::unwrap_used)]
+    fn lower_ok(
+        arena: &mut Arena<AExpr>,
+        function: IRFunctionExpr,
+        column: &str,
+    ) -> Expr {
+        lower_unary(arena, function, column).expect("lowering should succeed")
+    }
+
+    #[test]
+    fn abs_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(&mut arena, IRFunctionExpr::Abs, "f"),
+            Expr::Unary(UnaryOp::Abs, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn ceil_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(&mut arena, IRFunctionExpr::Ceil, "f"),
+            Expr::Unary(UnaryOp::Ceil, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn floor_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(&mut arena, IRFunctionExpr::Floor, "f"),
+            Expr::Unary(UnaryOp::Floor, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn exp_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(&mut arena, IRFunctionExpr::Exp, "f"),
+            Expr::Unary(UnaryOp::Exp, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn log1p_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(&mut arena, IRFunctionExpr::Log1p, "f"),
+            Expr::Unary(UnaryOp::Log1p, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn sign_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(&mut arena, IRFunctionExpr::Sign, "f"),
+            Expr::Unary(UnaryOp::Sign, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn sin_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(
+                &mut arena,
+                IRFunctionExpr::Trigonometry(polars_plan::plans::IRTrigonometricFunction::Sin),
+                "f",
+            ),
+            Expr::Unary(UnaryOp::Sin, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn cos_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(
+                &mut arena,
+                IRFunctionExpr::Trigonometry(polars_plan::plans::IRTrigonometricFunction::Cos),
+                "f",
+            ),
+            Expr::Unary(UnaryOp::Cos, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn sqrt_lowers_on_float_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(
+                &mut arena,
+                IRFunctionExpr::Pow(polars_plan::plans::IRPowFunction::Sqrt),
+                "f",
+            ),
+            Expr::Unary(UnaryOp::Sqrt, Box::new(Expr::Col(name("f")))),
+        );
+    }
+
+    #[test]
+    fn negate_lowers_on_int_column() {
+        let mut arena = Arena::new();
+        assert_eq!(
+            lower_ok(&mut arena, IRFunctionExpr::Negate, "i"),
+            Expr::Unary(UnaryOp::Negate, Box::new(Expr::Col(name("i")))),
+        );
+    }
+
+    #[test]
+    fn tangent_is_rejected() {
+        let mut arena = Arena::new();
+        assert!(lower_unary(
+            &mut arena,
+            IRFunctionExpr::Trigonometry(polars_plan::plans::IRTrigonometricFunction::Tan),
+            "f",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_function_is_rejected() {
+        let mut arena = Arena::new();
+        assert!(lower_unary(&mut arena, IRFunctionExpr::Unique(false), "f").is_err());
+    }
+
+    #[test]
+    fn unary_function_dtype_passthrough() {
+        // The dtype of a unary math function is the dtype of its input.
+        let expr = Expr::Unary(UnaryOp::Abs, Box::new(Expr::Col(name("f"))));
+        let arena = Arena::new();
+        let mut builder = Builder::new(&arena);
+        builder.schema = vec![(name("f"), DataType::Float64)];
+        #[expect(clippy::unwrap_used)]
+        let dtype = builder.expr_dtype(&expr).expect("expr_dtype should succeed");
+        assert_eq!(dtype, DataType::Float64);
+    }
+
+    #[test]
+    fn unary_function_over_int_preserves_int() {
+        let expr = Expr::Unary(UnaryOp::Negate, Box::new(Expr::Col(name("i"))));
+        let arena = Arena::new();
+        let mut builder = Builder::new(&arena);
+        builder.schema = vec![(name("i"), DataType::Int32)];
+        #[expect(clippy::unwrap_used)]
+        let dtype = builder.expr_dtype(&expr).expect("expr_dtype should succeed");
+        assert_eq!(dtype, DataType::Int32);
+    }
+
+    #[test]
+    fn float_only_math_ops_reject_int_column() {
+        // abs, ceil, floor, exp, sqrt, log1p, sin, cos, sign — all
+        // float-only — must be rejected at lowering when applied to an
+        // integer column so the engine falls back to the CPU cleanly.
+        let float_only_fns = vec![
+            IRFunctionExpr::Abs,
+            IRFunctionExpr::Ceil,
+            IRFunctionExpr::Floor,
+            IRFunctionExpr::Exp,
+            IRFunctionExpr::Log1p,
+            IRFunctionExpr::Sign,
+            IRFunctionExpr::Pow(polars_plan::plans::IRPowFunction::Sqrt),
+            IRFunctionExpr::Trigonometry(polars_plan::plans::IRTrigonometricFunction::Sin),
+            IRFunctionExpr::Trigonometry(polars_plan::plans::IRTrigonometricFunction::Cos),
+        ];
+        for function in float_only_fns {
+            let mut arena = Arena::new();
+            assert!(
+                lower_unary(&mut arena, function.clone(), "i").is_err(),
+                "expected {function:?} on int column to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn negate_is_not_float_only_and_accepts_int_column() {
+        let mut arena = Arena::new();
+        assert!(lower_unary(&mut arena, IRFunctionExpr::Negate, "i").is_ok());
     }
 }

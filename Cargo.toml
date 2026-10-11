@@ -19,11 +19,11 @@ eyre = "0.6.14"
 polars-arrow = "=0.55.1"
 polars-buffer = "=0.55.1"
 polars-config = "=0.55.1"
-polars-core = "=0.55.1"
+polars-core = { version = "=0.55.1", features = ["dtype-decimal"] }
 polars-error = "=0.55.1"
 polars-io = "=0.55.1"
-polars-lazy = "=0.55.1"
-polars-plan = "=0.55.1"
+polars-lazy = { version = "=0.55.1", features = ["abs", "log", "round_series", "sign", "trigonometry"] }
+polars-plan = { version = "=0.55.1", features = ["abs", "log", "round_series", "sign", "trigonometry"] }
 polars-utils = "=0.55.1"
 proptest = "1.11.0"
 rustc-hash = "2"

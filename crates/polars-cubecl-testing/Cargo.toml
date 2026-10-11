@@ -18,7 +18,7 @@ parquet = ["polars-cubecl/parquet"]
 [dependencies]
 polars-arrow = { workspace = true }
 polars-core = { workspace = true }
-polars-cubecl = { path = "../polars-cubecl" }
+polars-cubecl = { version = "0.1.0", path = "../polars-cubecl" }
 polars-lazy = { workspace = true }
 proptest = { workspace = true }
 thiserror = { workspace = true }

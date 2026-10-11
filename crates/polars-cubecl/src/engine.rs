@@ -156,7 +156,7 @@ fn splice_result(node: Node, lp_arena: &mut Arena<IR>, computed: DataFrame) {
 /// transfer/projection round-trip, which the hybrid driver skips to avoid
 /// pointless traffic).
 fn has_kernel_work(ops: &[crate::Op]) -> bool {
-    ops.iter().any(|op| matches!(op, crate::Op::Filter | crate::Op::Slice | crate::Op::GroupBy))
+    ops.iter().any(|op| matches!(op, crate::Op::Filter | crate::Op::Slice | crate::Op::GroupBy | crate::Op::Sort))
 }
 
 /// Top-down hybrid substitution: execute the largest supported subtrees on

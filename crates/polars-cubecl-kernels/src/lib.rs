@@ -25,7 +25,7 @@
 
 use cubecl::prelude::{BufferArg, Client, CubeCount, CubeDim, Numeric};
 use cubecl_runtime::server::Handle;
-pub use inner::{CmpOp, LogicOp};
+pub use inner::{BinOp, CmpOp, LogicOp, UnaryOp};
 use thiserror::Error;
 
 /// Threads per cube for elementwise kernels.
@@ -779,6 +779,622 @@ pub fn launch_reduce_count(
     Ok(())
 }
 
+/// Segmented product, one thread per group. Empty segments yield identity `1`
+/// with valid output (matches the CPU engine: product of nothing is `1`).
+pub fn launch_reduce_product<T: Numeric>(
+    client: &Client,
+    values: &Handle,
+    valid: &Handle,
+    values_len: usize,
+    params: ReduceParams<'_>,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(params.num_groups)? else { return Ok(()) };
+    unsafe {
+        inner::reduce_product_kernel::launch::<T>(
+            client,
+            count,
+            dim(),
+            wrap(values, values_len),
+            wrap(valid, values_len),
+            wrap(params.slots, values_len),
+            wrap(params.seg_off, params.num_groups),
+            wrap(params.seg_len, params.num_groups),
+            wrap(params.out_values, params.num_groups),
+            wrap(params.out_valid, params.num_groups),
+        );
+    }
+    Ok(())
+}
+
+/// Segmented standard deviation as `sqrt( sum((x - mean)^2) / (n - ddof))` in
+/// `f64`, one thread per group. Two-pass: mean first, then variance.
+/// Segments with fewer than `ddof + 1` valid values yield null.
+pub fn launch_reduce_std<T: Numeric>(
+    client: &Client,
+    values: &Handle,
+    valid: &Handle,
+    values_len: usize,
+    ddof: u8,
+    params: ReduceParams<'_>,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(params.num_groups)? else { return Ok(()) };
+    unsafe {
+        inner::reduce_std_kernel::launch::<T>(
+            client,
+            count,
+            dim(),
+            wrap(values, values_len),
+            wrap(valid, values_len),
+            wrap(params.slots, values_len),
+            wrap(params.seg_off, params.num_groups),
+            wrap(params.seg_len, params.num_groups),
+            ddof,
+            wrap(params.out_values, params.num_groups),
+            wrap(params.out_valid, params.num_groups),
+        );
+    }
+    Ok(())
+}
+
+/// Segmented variance as `sum((x - mean)^2) / (n - ddof)` in `f64`, one thread
+/// per group. Segments with fewer than `ddof + 1` valid values yield null.
+pub fn launch_reduce_var<T: Numeric>(
+    client: &Client,
+    values: &Handle,
+    valid: &Handle,
+    values_len: usize,
+    ddof: u8,
+    params: ReduceParams<'_>,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(params.num_groups)? else { return Ok(()) };
+    unsafe {
+        inner::reduce_var_kernel::launch::<T>(
+            client,
+            count,
+            dim(),
+            wrap(values, values_len),
+            wrap(valid, values_len),
+            wrap(params.slots, values_len),
+            wrap(params.seg_off, params.num_groups),
+            wrap(params.seg_len, params.num_groups),
+            ddof,
+            wrap(params.out_values, params.num_groups),
+            wrap(params.out_valid, params.num_groups),
+        );
+    }
+    Ok(())
+}
+
+// --- Binary arithmetic launch wrappers ---------------------------------
+
+/// Elementwise binary arithmetic op on two (integer-typed) columns.
+///
+/// Null in either operand yields a null output row. Division-by-zero yields
+/// a null row. Serves `i32`, `i64`, `u32`, `u64`; floats go through the
+/// concrete `launch_binop_f32`/`launch_binop_f64` below.
+pub fn launch_binop<T: Numeric>(
+    client: &Client,
+    lhs: &Handle,
+    lhs_valid: &Handle,
+    rhs: &Handle,
+    rhs_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: BinOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    // SAFETY: see [`wrap`]; all handles are freshly allocated for the
+    // launched shapes.
+    unsafe {
+        match op {
+            BinOp::Add => inner::binop_add_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Sub => inner::binop_sub_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Mul => inner::binop_mul_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Div => inner::binop_div_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::FloorDiv => inner::binop_floordiv_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Mod => inner::binop_mod_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Elementwise `f32` binary arithmetic op.
+pub fn launch_binop_f32(
+    client: &Client,
+    lhs: &Handle,
+    lhs_valid: &Handle,
+    rhs: &Handle,
+    rhs_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: BinOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            BinOp::Add => inner::binop_f32_add_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Sub => inner::binop_f32_sub_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Mul => inner::binop_f32_mul_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Div => inner::binop_f32_div_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::FloorDiv => inner::binop_f32_floordiv_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Mod => inner::binop_f32_mod_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Elementwise `f64` binary arithmetic op.
+pub fn launch_binop_f64(
+    client: &Client,
+    lhs: &Handle,
+    lhs_valid: &Handle,
+    rhs: &Handle,
+    rhs_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: BinOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            BinOp::Add => inner::binop_f64_add_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Sub => inner::binop_f64_sub_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Mul => inner::binop_f64_mul_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Div => inner::binop_f64_div_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::FloorDiv => inner::binop_f64_floordiv_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            BinOp::Mod => inner::binop_f64_mod_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
+// --- Unary arithmetic launch wrappers ----------------------------------
+
+/// Elementwise unary op on an integer-typed column.
+pub fn launch_unaryop<T: Numeric>(
+    client: &Client,
+    input: &Handle,
+    input_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: UnaryOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            UnaryOp::Abs => inner::unary_abs_kernel::launch::<T>(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Sign => inner::unary_sign_kernel::launch::<T>(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Negate => inner::unary_negate_kernel::launch::<T>(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Ceil | UnaryOp::Floor | UnaryOp::Exp | UnaryOp::Sqrt
+            | UnaryOp::Log1p | UnaryOp::Sin | UnaryOp::Cos => {
+                return Err(KernelError::RowCount); // Should be dispatched as float.
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Elementwise `f32` unary op.
+pub fn launch_unaryop_f32(
+    client: &Client,
+    input: &Handle,
+    input_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: UnaryOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            UnaryOp::Abs => inner::unary_f32_abs_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Ceil => inner::unary_f32_ceil_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Floor => inner::unary_f32_floor_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Exp => inner::unary_f32_exp_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Sqrt => inner::unary_f32_sqrt_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Log1p => inner::unary_f32_log1p_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Sin => inner::unary_f32_sin_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Cos => inner::unary_f32_cos_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Sign => inner::unary_f32_sign_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Negate => inner::unary_f32_negate_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Elementwise `f64` unary op.
+pub fn launch_unaryop_f64(
+    client: &Client,
+    input: &Handle,
+    input_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: UnaryOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            UnaryOp::Abs => inner::unary_f64_abs_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Ceil => inner::unary_f64_ceil_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Floor => inner::unary_f64_floor_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Exp => inner::unary_f64_exp_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Sqrt => inner::unary_f64_sqrt_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Log1p => inner::unary_f64_log1p_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Sin => inner::unary_f64_sin_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Cos => inner::unary_f64_cos_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Sign => inner::unary_f64_sign_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            UnaryOp::Negate => inner::unary_f64_negate_kernel::launch(
+                client, count, dim,
+                wrap(input, height), wrap(input_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
+// --- Column-vs-column comparison launch wrappers ----------------------
+
+/// Elementwise column-vs-column comparison for integer/boolean types.
+pub fn launch_col_cmp<T: Numeric>(
+    client: &Client,
+    lhs: &Handle,
+    lhs_valid: &Handle,
+    rhs: &Handle,
+    rhs_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: CmpOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            CmpOp::Eq => inner::col_cmp_eq_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::NotEq => inner::col_cmp_ne_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::Lt => inner::col_cmp_lt_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::LtEq => inner::col_cmp_le_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::Gt => inner::col_cmp_gt_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::GtEq => inner::col_cmp_ge_kernel::launch::<T>(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Elementwise `f32` column-vs-column comparison under the Polars total order.
+pub fn launch_col_cmp_f32(
+    client: &Client,
+    lhs: &Handle,
+    lhs_valid: &Handle,
+    rhs: &Handle,
+    rhs_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: CmpOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            CmpOp::Eq => inner::col_cmp_f32_eq_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::NotEq => inner::col_cmp_f32_ne_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::Lt => inner::col_cmp_f32_lt_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::LtEq => inner::col_cmp_f32_le_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::Gt => inner::col_cmp_f32_gt_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::GtEq => inner::col_cmp_f32_ge_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Elementwise `f64` column-vs-column comparison under the Polars total order.
+pub fn launch_col_cmp_f64(
+    client: &Client,
+    lhs: &Handle,
+    lhs_valid: &Handle,
+    rhs: &Handle,
+    rhs_valid: &Handle,
+    out: &Handle,
+    out_valid: &Handle,
+    height: usize,
+    op: CmpOp,
+) -> Result<(), KernelError> {
+    let Some(count) = count_for(height)? else { return Ok(()) };
+    let dim = dim();
+    unsafe {
+        match op {
+            CmpOp::Eq => inner::col_cmp_f64_eq_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::NotEq => inner::col_cmp_f64_ne_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::Lt => inner::col_cmp_f64_lt_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::LtEq => inner::col_cmp_f64_le_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::Gt => inner::col_cmp_f64_gt_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+            CmpOp::GtEq => inner::col_cmp_f64_ge_kernel::launch(
+                client, count, dim,
+                wrap(lhs, height), wrap(lhs_valid, height),
+                wrap(rhs, height), wrap(rhs_valid, height),
+                wrap(out, height), wrap(out_valid, height),
+            ),
+        }
+    }
+    Ok(())
+}
+
 mod inner {
     use cubecl::prelude::*;
 
@@ -806,6 +1422,48 @@ mod inner {
         And,
         /// Logical or.
         Or,
+    }
+
+    /// Binary arithmetic operators for [`launch_binop`](crate::launch_binop).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BinOp {
+        /// `left + right`.
+        Add,
+        /// `left - right`.
+        Sub,
+        /// `left * right`.
+        Mul,
+        /// `left / right` (true division).
+        Div,
+        /// `left // right` (floor division).
+        FloorDiv,
+        /// `left %% right` (modulus; remainder has the sign of the dividend).
+        Mod,
+    }
+
+    /// Unary (single-argument) elementwise operators on a column.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum UnaryOp {
+        /// `|x|` (absolute value).
+        Abs,
+        /// `⌈x⌉` (ceiling).
+        Ceil,
+        /// `⌊x⌋` (floor).
+        Floor,
+        /// `e^x` (exponential).
+        Exp,
+        /// `√x` (square root).
+        Sqrt,
+        /// `ln(1 + x)` (log1p).
+        Log1p,
+        /// `sin(x)`.
+        Sin,
+        /// `cos(x)`.
+        Cos,
+        /// `sign(x)` (`-1`, `0`, `+1` by sign, `NaN` stays `NaN`).
+        Sign,
+        /// `-x` (arithmetic negation).
+        Negate,
     }
 
     /// Compare one row against the literal; null rows never pass.
@@ -1387,4 +2045,834 @@ mod inner {
             out_valid[group] = 1u8;
         }
     }
+
+    /// Serial segmented product for the group owned by this unit.
+    ///
+    /// Empty segments yield identity `1` with valid output (matches the CPU
+    /// engine: the product of no elements is `1`).
+    #[cube(launch)]
+    pub fn reduce_product_kernel<T: Numeric>(
+        values: &[T],
+        valid: &[u8],
+        slots: &[u32],
+        seg_off: &[u32],
+        seg_len: &[u32],
+        out_values: &mut [T],
+        out_valid: &mut [u8],
+    ) {
+        let group = ABSOLUTE_POS;
+        if group < seg_len.len() {
+            let mut acc = T::from_int(1);
+            let mut count = 0u32;
+            let base = seg_off[group] as usize;
+            let len = seg_len[group] as usize;
+            let mut k = 0usize;
+            while k < len {
+                let row = slots[base + k] as usize;
+                if valid[row] != 0u8 {
+                    acc *= values[row];
+                    count += 1u32;
+                }
+                k += 1usize;
+            }
+            out_values[group] = acc;
+            // Identity `1` for empty groups (matches CPU polars).
+            out_valid[group] = if count > 0u32 || len == 0 { 1u8 } else { 0u8 };
+        }
+    }
+
+    /// Serial segmented standard deviation for the group owned by this unit.
+    ///
+    /// Two-pass: compute mean, then sum of squared deltas, finally
+    /// `sqrt(ss / (n - ddof))`. Output is `f64`; segments with fewer than
+    /// `ddof + 1` valid values yield null.
+    #[cube(launch)]
+    pub fn reduce_std_kernel<T: Numeric>(
+        values: &[T],
+        valid: &[u8],
+        slots: &[u32],
+        seg_off: &[u32],
+        seg_len: &[u32],
+        ddof: u8,
+        out_values: &mut [f64],
+        out_valid: &mut [u8],
+    ) {
+        let group = ABSOLUTE_POS;
+        if group < seg_len.len() {
+            let base = seg_off[group] as usize;
+            let len = seg_len[group] as usize;
+            // Pass 1: compute mean in f64.
+            let mut sum = 0.0f64;
+            let mut count = 0u32;
+            let mut k = 0usize;
+            while k < len {
+                let row = slots[base + k] as usize;
+                if valid[row] != 0u8 {
+                    sum += f64::cast_from(values[row]);
+                    count += 1u32;
+                }
+                k += 1usize;
+            }
+            if count > ddof as u32 {
+                let mean = sum / f64::cast_from(count);
+                // Pass 2: compute sum of squared deltas.
+                let mut ss = 0.0f64;
+                k = 0usize;
+                while k < len {
+                    let row = slots[base + k] as usize;
+                    if valid[row] != 0u8 {
+                        let delta = f64::cast_from(values[row]) - mean;
+                        ss += delta * delta;
+                    }
+                    k += 1usize;
+                }
+                let denom = f64::cast_from(count - ddof as u32);
+                out_values[group] = f64::sqrt(ss / denom);
+                out_valid[group] = 1u8;
+            } else {
+                out_values[group] = 0.0f64;
+                out_valid[group] = 0u8;
+            }
+        }
+    }
+
+    /// Serial segmented variance for the group owned by this unit.
+    ///
+    /// Two-pass: compute mean, then sum of squared deltas, finally
+    /// `ss / (n - ddof)`. Output is `f64`; segments with fewer than
+    /// `ddof + 1` valid values yield null.
+    #[cube(launch)]
+    pub fn reduce_var_kernel<T: Numeric>(
+        values: &[T],
+        valid: &[u8],
+        slots: &[u32],
+        seg_off: &[u32],
+        seg_len: &[u32],
+        ddof: u8,
+        out_values: &mut [f64],
+        out_valid: &mut [u8],
+    ) {
+        let group = ABSOLUTE_POS;
+        if group < seg_len.len() {
+            let base = seg_off[group] as usize;
+            let len = seg_len[group] as usize;
+            // Pass 1: compute mean in f64.
+            let mut sum = 0.0f64;
+            let mut count = 0u32;
+            let mut k = 0usize;
+            while k < len {
+                let row = slots[base + k] as usize;
+                if valid[row] != 0u8 {
+                    sum += f64::cast_from(values[row]);
+                    count += 1u32;
+                }
+                k += 1usize;
+            }
+            if count > ddof as u32 {
+                let mean = sum / f64::cast_from(count);
+                // Pass 2: compute sum of squared deltas.
+                let mut ss = 0.0f64;
+                k = 0usize;
+                while k < len {
+                    let row = slots[base + k] as usize;
+                    if valid[row] != 0u8 {
+                        let delta = f64::cast_from(values[row]) - mean;
+                        ss += delta * delta;
+                    }
+                    k += 1usize;
+                }
+                let denom = f64::cast_from(count - ddof as u32);
+                out_values[group] = ss / denom;
+                out_valid[group] = 1u8;
+            } else {
+                out_values[group] = 0.0f64;
+                out_valid[group] = 0u8;
+            }
+        }
+    }
+
+    // --- Binary arithmetic (column vs column) ----------------------------
+
+    /// Generic elementwise binary op for integer types.
+    ///
+    /// Null in either operand yields a null output row. Division-by-zero on
+    /// integer types yields `0` with a null output row, matching Polars.
+    macro_rules! binop_int_kernel {
+        ($name:ident, $op:tt) => {
+            #[cube(launch)]
+            pub fn $name<T: Numeric>(
+                lhs: &[T],
+                lhs_valid: &[u8],
+                rhs: &[T],
+                rhs_valid: &[u8],
+                out: &mut [T],
+                out_valid: &mut [u8],
+            ) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        out[row] = lhs[row] $op rhs[row];
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = T::from_int(0);
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+    }
+
+    // Division/modulus need zero-check on integers (no SIGFPE trap).
+    #[cube(launch)]
+    pub fn binop_div_kernel<T: Numeric>(
+        lhs: &[T],
+        lhs_valid: &[u8],
+        rhs: &[T],
+        rhs_valid: &[u8],
+        out: &mut [T],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 && rhs[row] != T::from_int(0) {
+                out[row] = lhs[row] / rhs[row];
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = T::from_int(0);
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn binop_floordiv_kernel<T: Numeric>(
+        lhs: &[T],
+        lhs_valid: &[u8],
+        rhs: &[T],
+        rhs_valid: &[u8],
+        out: &mut [T],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 && rhs[row] != T::from_int(0) {
+                let q = lhs[row] / rhs[row];
+                let r = lhs[row] % rhs[row];
+                // Floor correction: when signs differ and remainder != 0.
+                if r != T::from_int(0)
+                    && ((lhs[row] < T::from_int(0)) != (rhs[row] < T::from_int(0)))
+                {
+                    out[row] = q - T::from_int(1);
+                } else {
+                    out[row] = q;
+                }
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = T::from_int(0);
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn binop_mod_kernel<T: Numeric>(
+        lhs: &[T],
+        lhs_valid: &[u8],
+        rhs: &[T],
+        rhs_valid: &[u8],
+        out: &mut [T],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 && rhs[row] != T::from_int(0) {
+                out[row] = lhs[row] % rhs[row];
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = T::from_int(0);
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    binop_int_kernel!(binop_add_kernel, +);
+    binop_int_kernel!(binop_sub_kernel, -);
+    binop_int_kernel!(binop_mul_kernel, *);
+
+    /// Concrete `f32` binary op kernels. `Div`/`Mod` are guarded for Floats
+    /// (`NaN` propagation is the natural op; no SIGFPE, but still skip zero).
+    macro_rules! binop_f32_kernel {
+        ($name:ident, $op:tt) => {
+            #[cube(launch)]
+            pub fn $name(
+                lhs: &[f32],
+                lhs_valid: &[u8],
+                rhs: &[f32],
+                rhs_valid: &[u8],
+                out: &mut [f32],
+                out_valid: &mut [u8],
+            ) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        out[row] = lhs[row] $op rhs[row];
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0.0f32;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+    }
+
+    binop_f32_kernel!(binop_f32_add_kernel, +);
+    binop_f32_kernel!(binop_f32_sub_kernel, -);
+    binop_f32_kernel!(binop_f32_mul_kernel, *);
+    binop_f32_kernel!(binop_f32_div_kernel, /);
+
+    #[cube(launch)]
+    pub fn binop_f32_floordiv_kernel(
+        lhs: &[f32],
+        lhs_valid: &[u8],
+        rhs: &[f32],
+        rhs_valid: &[u8],
+        out: &mut [f32],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                let q = lhs[row] / rhs[row];
+                out[row] = q.floor();
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f32;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn binop_f32_mod_kernel(
+        lhs: &[f32],
+        lhs_valid: &[u8],
+        rhs: &[f32],
+        rhs_valid: &[u8],
+        out: &mut [f32],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                out[row] = lhs[row] % rhs[row];
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f32;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    /// Concrete `f64` binary op kernels.
+    macro_rules! binop_f64_kernel {
+        ($name:ident, $op:tt) => {
+            #[cube(launch)]
+            pub fn $name(
+                lhs: &[f64],
+                lhs_valid: &[u8],
+                rhs: &[f64],
+                rhs_valid: &[u8],
+                out: &mut [f64],
+                out_valid: &mut [u8],
+            ) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        out[row] = lhs[row] $op rhs[row];
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0.0f64;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+    }
+
+    binop_f64_kernel!(binop_f64_add_kernel, +);
+    binop_f64_kernel!(binop_f64_sub_kernel, -);
+    binop_f64_kernel!(binop_f64_mul_kernel, *);
+    binop_f64_kernel!(binop_f64_div_kernel, /);
+
+    #[cube(launch)]
+    pub fn binop_f64_floordiv_kernel(
+        lhs: &[f64],
+        lhs_valid: &[u8],
+        rhs: &[f64],
+        rhs_valid: &[u8],
+        out: &mut [f64],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                let q = lhs[row] / rhs[row];
+                out[row] = q.floor();
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f64;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn binop_f64_mod_kernel(
+        lhs: &[f64],
+        lhs_valid: &[u8],
+        rhs: &[f64],
+        rhs_valid: &[u8],
+        out: &mut [f64],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                out[row] = lhs[row] % rhs[row];
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f64;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    // --- Unary elementwise -------------------------------------------------
+
+    /// Generic integer abs and sign.
+    #[cube(launch)]
+    pub fn unary_abs_kernel<T: Numeric>(
+        input: &[T],
+        input_valid: &[u8],
+        out: &mut [T],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                let v = input[row];
+                out[row] = if v < T::from_int(0) { T::from_int(0) - v } else { v };
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = T::from_int(0);
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn unary_negate_kernel<T: Numeric>(
+        input: &[T],
+        input_valid: &[u8],
+        out: &mut [T],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                out[row] = T::from_int(0) - input[row];
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = T::from_int(0);
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn unary_sign_kernel<T: Numeric>(
+        input: &[T],
+        input_valid: &[u8],
+        out: &mut [T],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                let v = input[row];
+                out[row] = if v > T::from_int(0) {
+                    T::from_int(1)
+                } else if v < T::from_int(0) {
+                    T::from_int(0) - T::from_int(1)
+                } else {
+                    T::from_int(0)
+                };
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = T::from_int(0);
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    /// Float unary kernels (Ceil, Floor, Exp, Sqrt, Log1p, Sin, Cos, Abs,
+    /// Sign, Negate) - per function to keep each kernel a straight line.
+    macro_rules! unary_f32_unary_kernel {
+        ($name:ident, $method:ident) => {
+            #[cube(launch)]
+            pub fn $name(
+                input: &[f32],
+                input_valid: &[u8],
+                out: &mut [f32],
+                out_valid: &mut [u8],
+            ) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if input_valid[row] != 0u8 {
+                        out[row] = input[row].$method();
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0.0f32;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+    }
+
+    unary_f32_unary_kernel!(unary_f32_ceil_kernel, ceil);
+    unary_f32_unary_kernel!(unary_f32_floor_kernel, floor);
+    unary_f32_unary_kernel!(unary_f32_exp_kernel, exp);
+    unary_f32_unary_kernel!(unary_f32_sqrt_kernel, sqrt);
+    unary_f32_unary_kernel!(unary_f32_log1p_kernel, log1p);
+    unary_f32_unary_kernel!(unary_f32_sin_kernel, sin);
+    unary_f32_unary_kernel!(unary_f32_cos_kernel, cos);
+
+    #[cube(launch)]
+    pub fn unary_f32_abs_kernel(
+        input: &[f32],
+        input_valid: &[u8],
+        out: &mut [f32],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                out[row] = input[row].abs();
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f32;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn unary_f32_sign_kernel(
+        input: &[f32],
+        input_valid: &[u8],
+        out: &mut [f32],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                let v = input[row];
+                out[row] = if v.is_nan() {
+                    f32::NAN
+                } else if v > 0.0f32 {
+                    1.0f32
+                } else if v < 0.0f32 {
+                    0.0f32 - 1.0f32
+                } else {
+                    0.0f32
+                };
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f32;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn unary_f32_negate_kernel(
+        input: &[f32],
+        input_valid: &[u8],
+        out: &mut [f32],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                out[row] = 0.0f32 - input[row];
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f32;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    macro_rules! unary_f64_unary_kernel {
+        ($name:ident, $method:ident) => {
+            #[cube(launch)]
+            pub fn $name(
+                input: &[f64],
+                input_valid: &[u8],
+                out: &mut [f64],
+                out_valid: &mut [u8],
+            ) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if input_valid[row] != 0u8 {
+                        out[row] = input[row].$method();
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0.0f64;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+    }
+
+    unary_f64_unary_kernel!(unary_f64_ceil_kernel, ceil);
+    unary_f64_unary_kernel!(unary_f64_floor_kernel, floor);
+    unary_f64_unary_kernel!(unary_f64_exp_kernel, exp);
+    unary_f64_unary_kernel!(unary_f64_sqrt_kernel, sqrt);
+    unary_f64_unary_kernel!(unary_f64_log1p_kernel, log1p);
+    unary_f64_unary_kernel!(unary_f64_sin_kernel, sin);
+    unary_f64_unary_kernel!(unary_f64_cos_kernel, cos);
+
+    #[cube(launch)]
+    pub fn unary_f64_abs_kernel(
+        input: &[f64],
+        input_valid: &[u8],
+        out: &mut [f64],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                out[row] = input[row].abs();
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f64;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn unary_f64_sign_kernel(
+        input: &[f64],
+        input_valid: &[u8],
+        out: &mut [f64],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                let v = input[row];
+                out[row] = if v.is_nan() {
+                    f64::NAN
+                } else if v > 0.0f64 {
+                    1.0f64
+                } else if v < 0.0f64 {
+                    0.0f64 - 1.0f64
+                } else {
+                    0.0f64
+                };
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f64;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    #[cube(launch)]
+    pub fn unary_f64_negate_kernel(
+        input: &[f64],
+        input_valid: &[u8],
+        out: &mut [f64],
+        out_valid: &mut [u8],
+    ) {
+        let row = ABSOLUTE_POS;
+        if row < out.len() {
+            if input_valid[row] != 0u8 {
+                out[row] = 0.0f64 - input[row];
+                out_valid[row] = 1u8;
+            } else {
+                out[row] = 0.0f64;
+                out_valid[row] = 0u8;
+            }
+        }
+    }
+
+    // --- Column-vs-column comparisons ------------------------------------
+
+    /// Integer col_cmp kernels — each spelled out inline so macro hygiene
+    /// keeps `lhs`/`rhs`/`row` accessible.
+    macro_rules! col_cmp_int_kernel {
+        ($name:ident, $op:tt) => {
+            #[cube(launch)]
+            pub fn $name<T: Numeric>(
+                lhs: &[T],
+                lhs_valid: &[u8],
+                rhs: &[T],
+                rhs_valid: &[u8],
+                out: &mut [u8],
+                out_valid: &mut [u8],
+            ) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        let passed = lhs[row] $op rhs[row];
+                        out[row] = if passed { 1u8 } else { 0u8 };
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0u8;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+    }
+
+    col_cmp_int_kernel!(col_cmp_eq_kernel, ==);
+    col_cmp_int_kernel!(col_cmp_ne_kernel, !=);
+    col_cmp_int_kernel!(col_cmp_lt_kernel, <);
+    col_cmp_int_kernel!(col_cmp_le_kernel, <=);
+    col_cmp_int_kernel!(col_cmp_gt_kernel, >);
+    col_cmp_int_kernel!(col_cmp_ge_kernel, >=);
+
+    /// Float col_cmp under the Polars total order (`NaN` sorts above
+    /// `+inf`). Same `is_nan()`-based ordering as the literal comparison
+    /// kernels above.
+    macro_rules! col_cmp_float_kernel {
+        ($name:ident, $ty:ty, Eq) => {
+            #[cube(launch)]
+            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        let a = lhs[row];
+                        let b = rhs[row];
+                        let lt = (a < b) || (!a.is_nan() && b.is_nan());
+                        let gt = (b < a) || (!b.is_nan() && a.is_nan());
+                        out[row] = (!(lt || gt)) as u8;
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0u8;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+        ($name:ident, $ty:ty, NotEq) => {
+            #[cube(launch)]
+            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        let a = lhs[row];
+                        let b = rhs[row];
+                        let lt = (a < b) || (!a.is_nan() && b.is_nan());
+                        let gt = (b < a) || (!b.is_nan() && a.is_nan());
+                        out[row] = ((lt) || (gt)) as u8;
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0u8;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+        ($name:ident, $ty:ty, Lt) => {
+            #[cube(launch)]
+            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        let a = lhs[row];
+                        let b = rhs[row];
+                        out[row] = ((a < b) || (!a.is_nan() && b.is_nan())) as u8;
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0u8;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+        ($name:ident, $ty:ty, LtEq) => {
+            #[cube(launch)]
+            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        let a = lhs[row];
+                        let b = rhs[row];
+                        let gt = (b < a) || (!b.is_nan() && a.is_nan());
+                        out[row] = (!(gt)) as u8;
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0u8;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+        ($name:ident, $ty:ty, Gt) => {
+            #[cube(launch)]
+            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        let a = lhs[row];
+                        let b = rhs[row];
+                        out[row] = ((b < a) || (!b.is_nan() && a.is_nan())) as u8;
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0u8;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+        ($name:ident, $ty:ty, GtEq) => {
+            #[cube(launch)]
+            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+                let row = ABSOLUTE_POS;
+                if row < out.len() {
+                    if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
+                        let a = lhs[row];
+                        let b = rhs[row];
+                        let lt = (a < b) || (!a.is_nan() && b.is_nan());
+                        out[row] = (!(lt)) as u8;
+                        out_valid[row] = 1u8;
+                    } else {
+                        out[row] = 0u8;
+                        out_valid[row] = 0u8;
+                    }
+                }
+            }
+        };
+    }
+
+    col_cmp_float_kernel!(col_cmp_f32_eq_kernel, f32, Eq);
+    col_cmp_float_kernel!(col_cmp_f32_ne_kernel, f32, NotEq);
+    col_cmp_float_kernel!(col_cmp_f32_lt_kernel, f32, Lt);
+    col_cmp_float_kernel!(col_cmp_f32_le_kernel, f32, LtEq);
+    col_cmp_float_kernel!(col_cmp_f32_gt_kernel, f32, Gt);
+    col_cmp_float_kernel!(col_cmp_f32_ge_kernel, f32, GtEq);
+    col_cmp_float_kernel!(col_cmp_f64_eq_kernel, f64, Eq);
+    col_cmp_float_kernel!(col_cmp_f64_ne_kernel, f64, NotEq);
+    col_cmp_float_kernel!(col_cmp_f64_lt_kernel, f64, Lt);
+    col_cmp_float_kernel!(col_cmp_f64_le_kernel, f64, LtEq);
+    col_cmp_float_kernel!(col_cmp_f64_gt_kernel, f64, Gt);
+    col_cmp_float_kernel!(col_cmp_f64_ge_kernel, f64, GtEq);
 }

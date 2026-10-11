@@ -338,20 +338,24 @@ fn reduce_agg(
     grouping: &Grouping,
     seg: &Segmentation<'_>,
 ) -> Result<DeviceColumn, ExecError> {
-    // `f64` arithmetic (and `mean`, whose output is always `f64`) needs true
-    // `double`; movement-only aggs (`first`/`last`/`count`/`len`) run anywhere.
+    // `f64` arithmetic (and `mean`/`std`/`var`, whose output is always `f64`)
+    // needs true `double`; movement-only aggs (`first`/`last`/`count`/`len`)
+    // run anywhere. `product` preserves input dtype, `median` preserves it
+    // but needs no arithmetic on the device.
     let needs_f64 = match agg {
         Aggregation::Sum { input, .. } |
         Aggregation::Min { input, .. } |
-        Aggregation::Max { input, .. } => {
+        Aggregation::Max { input, .. } |
+        Aggregation::Product { input, .. } => {
             let index = find_column(columns, input)?;
             columns[index].dtype() == DType::F64
         }
-        Aggregation::Mean { .. } => true,
+        Aggregation::Mean { .. } | Aggregation::Std { .. } | Aggregation::Var { .. } => true,
         Aggregation::Count { .. } |
         Aggregation::First { .. } |
         Aggregation::Last { .. } |
-        Aggregation::Len { .. } => false,
+        Aggregation::Len { .. } |
+        Aggregation::Median { .. } => false,
     };
     if needs_f64 && !f64_ok {
         return Err(ExecError::BackendUnsupported(
@@ -420,6 +424,33 @@ fn reduce_agg(
         }
         Aggregation::Last { input, output } => {
             pick_end(client, columns, input, output, &grouping.last_rows, seg.num_groups)
+        }
+        Aggregation::Product { input, output } => {
+            let (dtype, values, validity) = reduce_product(client, columns, input, seg)?;
+            Ok(DeviceColumn::from_handles(output.clone(), dtype, values, validity, seg.num_groups))
+        }
+        Aggregation::Std { input, output, ddof } => {
+            let (values, validity) = reduce_std(client, columns, input, seg, *ddof)?;
+            Ok(DeviceColumn::from_handles(
+                output.clone(),
+                DType::F64,
+                values,
+                validity,
+                seg.num_groups,
+            ))
+        }
+        Aggregation::Var { input, output, ddof } => {
+            let (values, validity) = reduce_var(client, columns, input, seg, *ddof)?;
+            Ok(DeviceColumn::from_handles(
+                output.clone(),
+                DType::F64,
+                values,
+                validity,
+                seg.num_groups,
+            ))
+        }
+        Aggregation::Median { input, output } => {
+            reduce_median(client, columns, input, output, seg)
         }
         Aggregation::Len { output } => {
             let out_values = create_slice(client, bytemuck::cast_slice(&grouping.sizes));
@@ -680,4 +711,290 @@ fn pick_end(
     let validity = alloc(client, num_groups);
     gather_picked(client, source, &positions_handle, &values, &validity, num_groups)?;
     Ok(DeviceColumn::from_handles(output.clone(), source.dtype(), values, validity, num_groups))
+}
+
+/// Grouped product in the input dtype. Returns the output dtype with its buffers.
+fn reduce_product(
+    client: &Client,
+    columns: &[DeviceColumn],
+    input: &PlSmallStr,
+    seg: &Segmentation<'_>,
+) -> Result<(DType, Handle, Handle), ExecError> {
+    let index = find_column(columns, input)?;
+    let source = &columns[index];
+    let out_valid = alloc(client, seg.num_groups);
+    macro_rules! run {
+        ($t:ty, $dtype:expr) => {{
+            let out_values = alloc(client, seg.num_groups.saturating_mul(dtype_size($dtype)));
+            polars_cubecl_kernels::launch_reduce_product::<$t>(
+                client,
+                source.values(),
+                source.validity(),
+                source.len(),
+                polars_cubecl_kernels::ReduceParams {
+                    slots: seg.slots,
+                    seg_off: seg.seg_off,
+                    seg_len: seg.seg_len,
+                    num_groups: seg.num_groups,
+                    out_values: &out_values,
+                    out_valid: &out_valid,
+                },
+            )?;
+            ($dtype, out_values)
+        }};
+    }
+    let (dtype, out_values) = match source.dtype() {
+        DType::I32 => run!(i32, DType::I32),
+        DType::I64 => run!(i64, DType::I64),
+        DType::U32 => run!(u32, DType::U32),
+        DType::U64 => run!(u64, DType::U64),
+        DType::F32 => run!(f32, DType::F32),
+        DType::F64 => run!(f64, DType::F64),
+        DType::Bool => {
+            return Err(ExecError::Inconsistent("product over booleans".to_string()));
+        }
+    };
+    Ok((dtype, out_values, out_valid))
+}
+
+/// Grouped standard deviation in `f64`. Dispatches to the type-specific kernel.
+fn reduce_std(
+    client: &Client,
+    columns: &[DeviceColumn],
+    input: &PlSmallStr,
+    seg: &Segmentation<'_>,
+    ddof: u8,
+) -> Result<(Handle, Handle), ExecError> {
+    let index = find_column(columns, input)?;
+    let source = &columns[index];
+    let out_values = alloc(client, seg.num_groups.saturating_mul(8));
+    let out_valid = alloc(client, seg.num_groups);
+    match source.dtype() {
+        DType::I32 => polars_cubecl_kernels::launch_reduce_std::<i32>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::I64 => polars_cubecl_kernels::launch_reduce_std::<i64>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::U32 => polars_cubecl_kernels::launch_reduce_std::<u32>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::U64 => polars_cubecl_kernels::launch_reduce_std::<u64>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::F32 => polars_cubecl_kernels::launch_reduce_std::<f32>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::F64 => polars_cubecl_kernels::launch_reduce_std::<f64>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::Bool => polars_cubecl_kernels::launch_reduce_std::<u8>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+    }
+    Ok((out_values, out_valid))
+}
+
+/// Grouped variance in `f64`. Dispatches to the type-specific kernel.
+fn reduce_var(
+    client: &Client,
+    columns: &[DeviceColumn],
+    input: &PlSmallStr,
+    seg: &Segmentation<'_>,
+    ddof: u8,
+) -> Result<(Handle, Handle), ExecError> {
+    let index = find_column(columns, input)?;
+    let source = &columns[index];
+    let out_values = alloc(client, seg.num_groups.saturating_mul(8));
+    let out_valid = alloc(client, seg.num_groups);
+    match source.dtype() {
+        DType::I32 => polars_cubecl_kernels::launch_reduce_var::<i32>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::I64 => polars_cubecl_kernels::launch_reduce_var::<i64>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::U32 => polars_cubecl_kernels::launch_reduce_var::<u32>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::U64 => polars_cubecl_kernels::launch_reduce_var::<u64>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::F32 => polars_cubecl_kernels::launch_reduce_var::<f32>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::F64 => polars_cubecl_kernels::launch_reduce_var::<f64>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+        DType::Bool => polars_cubecl_kernels::launch_reduce_var::<u8>(
+            client,
+            source.values(),
+            source.validity(),
+            source.len(),
+            ddof,
+            params(seg, &out_values, &out_valid),
+        )?,
+    }
+    Ok((out_values, out_valid))
+}
+
+fn params<'a>(
+    seg: &Segmentation<'a>,
+    out_values: &'a Handle,
+    out_valid: &'a Handle,
+) -> polars_cubecl_kernels::ReduceParams<'a> {
+    polars_cubecl_kernels::ReduceParams {
+        slots: seg.slots,
+        seg_off: seg.seg_off,
+        seg_len: seg.seg_len,
+        num_groups: seg.num_groups,
+        out_values,
+        out_valid,
+    }
+}
+
+/// Grouped median, computed host-side: gather valid values per group, sort,
+/// and pick the middle (or average of two middles) element.
+///
+/// The raw device handles for `slots`, `seg_off`, and `seg_len` are read back
+/// with `client.read_one` and interpreted as `u32` slices.
+fn reduce_median(
+    client: &Client,
+    columns: &[DeviceColumn],
+    input: &PlSmallStr,
+    output: &PlSmallStr,
+    seg: &Segmentation<'_>,
+) -> Result<DeviceColumn, ExecError> {
+    let index = find_column(columns, input)?;
+    let source = &columns[index];
+    let host = download(client, source)?;
+
+    // Read raw slot/segment data from device handles.
+    let slots_bytes = client
+        .read_one(seg.slots.clone())
+        .map_err(|e| ExecError::Launch(e.to_string()))?;
+    let seg_off_bytes = client
+        .read_one(seg.seg_off.clone())
+        .map_err(|e| ExecError::Launch(e.to_string()))?;
+    let seg_len_bytes = client
+        .read_one(seg.seg_len.clone())
+        .map_err(|e| ExecError::Launch(e.to_string()))?;
+    let slots_u32: &[u32] = bytemuck::cast_slice(&slots_bytes);
+    let seg_off: &[u32] = bytemuck::cast_slice(&seg_off_bytes);
+    let seg_len: &[u32] = bytemuck::cast_slice(&seg_len_bytes);
+
+    // Gather valid values per group from the slot permutation.
+    let mut group_values: Vec<Vec<f64>> = vec![Vec::new(); seg.num_groups];
+    for group in 0..seg.num_groups {
+        let base = seg_off[group] as usize;
+        let len = seg_len[group] as usize;
+        for k in 0..len {
+            let row = slots_u32[base + k] as usize;
+            if host.validity()[row] != 0 {
+                let val = match (source.dtype(), host.values()) {
+                    (DType::I32, HostValues::I32(v)) => f64::from(v[row]),
+                    (DType::I64, HostValues::I64(v)) => v[row] as f64,
+                    (DType::U32, HostValues::U32(v)) => f64::from(v[row]),
+                    (DType::U64, HostValues::U64(v)) => v[row] as f64,
+                    (DType::F32, HostValues::F32(v)) => f64::from(v[row]),
+                    (DType::F64, HostValues::F64(v)) => v[row],
+                    (DType::Bool, HostValues::Bool(v)) => f64::from(v[row]),
+                    _ => 0.0,
+                };
+                group_values[group].push(val);
+            }
+        }
+    }
+
+    // Compute median per group.
+    let mut out_vals = vec![0.0f64; seg.num_groups];
+    let mut out_valid = vec![0u8; seg.num_groups];
+    for group in 0..seg.num_groups {
+        let vals = &mut group_values[group];
+        if vals.is_empty() {
+            out_vals[group] = 0.0;
+            out_valid[group] = 0;
+            continue;
+        }
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = vals.len();
+        let median = if n % 2 == 1 {
+            vals[n / 2]
+        } else {
+            (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+        };
+        out_vals[group] = median;
+        out_valid[group] = 1;
+    }
+
+    // Median is always output as f64 (matches Polars semantics).
+    let out_valid_buf = create_slice(client, &out_valid);
+    let out_values_buf = create_slice(client, bytemuck::cast_slice(&out_vals));
+
+    Ok(DeviceColumn::from_handles(output.clone(), DType::F64, out_values_buf, out_valid_buf, seg.num_groups))
 }

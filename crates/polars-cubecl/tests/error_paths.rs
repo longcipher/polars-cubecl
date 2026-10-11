@@ -9,9 +9,9 @@ use polars_core::{
     frame::DataFrame,
     prelude::{NamedFrom, Series},
 };
-use polars_cubecl::{CubeclEngine, EngineConfig};
+use polars_cubecl::{CubeclEngine, EngineConfig, Op};
 use polars_cubecl_testing::{
-    CompareRules, HarnessError, all_backends, check_fallback_backend,
+    CompareRules, HarnessError, all_backends, check_backend_sorted, check_fallback_backend,
     check_fallback_backend_unsorted,
 };
 use polars_lazy::{
@@ -69,12 +69,12 @@ fn min_rows_zero_engages_on_any_size() {
 }
 
 // ---------------------------------------------------------------------------
-// Strict mode: unsupported queries must error, not panic.
+// Sort: now supported in strict mode and non-strict mode, on every backend.
 // ---------------------------------------------------------------------------
 
 #[test]
 #[expect(clippy::expect_used, reason = "test asserts engine creation")]
-fn strict_mode_errors_on_pure_sort() {
+fn strict_mode_sort_engages_and_is_cpu_correct() {
     let frame = DataFrame::new_infer_height(vec![
         Series::new("a".into(), &[3_i32, 1, 4, 1, 5, 9, 2, 6]).into(),
     ])
@@ -83,18 +83,18 @@ fn strict_mode_errors_on_pure_sort() {
         let config = EngineConfig { backend, raise_on_fail: false, min_rows_for_gpu: 0 };
         let engine = CubeclEngine::new(config).expect("engine creation failed");
         let lf = frame.clone().lazy().sort(["a"], Default::default());
-        // Strict mode on an unsupported query must error (not panic).
-        assert!(
-            engine.collect_strict(lf).is_err(),
-            "strict sort should fail on backend {backend:?}"
-        );
+        let (result, report) = engine.collect_strict_with_report(lf).expect("strict sort failed");
+        assert!(report.engaged(), "sort should engage the GPU engine");
+        assert!(report.ops_ran().contains(&Op::Sort));
+        let expected = frame.clone().lazy().sort(["a"], Default::default()).collect().unwrap();
+        assert_eq!(result, expected);
     }
 }
 
 #[test]
 #[expect(clippy::expect_used, reason = "test asserts cpu fallback collect")]
 #[expect(clippy::unwrap_used, reason = "test asserts cpu-correct baseline")]
-fn non_strict_mode_sorts_via_fallback() {
+fn non_strict_mode_sort_engages_and_is_cpu_correct() {
     let frame = DataFrame::new_infer_height(vec![
         Series::new("a".into(), &[3_i32, 1, 4, 1, 5, 9, 2, 6]).into(),
     ])
@@ -103,30 +103,35 @@ fn non_strict_mode_sorts_via_fallback() {
         let config = EngineConfig { backend, raise_on_fail: false, min_rows_for_gpu: 0 };
         let engine = CubeclEngine::new(config).expect("engine creation failed");
         let lf = frame.clone().lazy().sort(["a"], Default::default());
-        // Non-strict mode: sort falls back to CPU and returns correct results.
         let (result, report) = engine.collect_with_report(lf).expect("non-strict collect failed");
-        assert!(!report.engaged(), "sort should not engage the GPU engine");
+        assert!(report.engaged(), "sort should engage the GPU engine");
         let expected = frame.clone().lazy().sort(["a"], Default::default()).collect().unwrap();
         assert_eq!(result, expected);
     }
 }
 
-// ---------------------------------------------------------------------------
-// raise_on_fail: makes non-strict collect behave like strict.
-// ---------------------------------------------------------------------------
+#[test]
+#[expect(clippy::expect_used, reason = "test asserts sorted correctness")]
+fn sort_i64_matches_oracle() -> Result<(), HarnessError> {
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("a".into(), &[3_i64, 1, 4, 1, 5, 9, 2, 6]).into(),
+        Series::new("b".into(), &[10_i64, 20, 30, 40, 50, 60, 70, 80]).into(),
+    ])
+    .unwrap_or(DataFrame::empty_with_height(0));
+    let lf = frame.lazy().sort(["a"], Default::default());
+    check_backend_sorted(&lf, all_backends(), &["a"], false)
+}
 
 #[test]
-#[expect(clippy::expect_used, reason = "test asserts engine creation")]
-fn raise_on_fail_makes_collect_err_on_unsupported() {
-    let frame =
-        DataFrame::new_infer_height(vec![Series::new("a".into(), &[3_i32, 1, 4, 1, 5]).into()])
-            .unwrap_or(DataFrame::empty_with_height(0));
-    for backend in all_backends() {
-        let config = EngineConfig { backend, raise_on_fail: true, min_rows_for_gpu: 0 };
-        let engine = CubeclEngine::new(config).expect("engine creation failed");
-        let lf = frame.clone().lazy().sort(["a"], Default::default());
-        assert!(engine.collect(lf).is_err(), "raise_on_fail should error on unsupported sort");
-    }
+#[expect(clippy::expect_used, reason = "test asserts sorted correctness with nulls")]
+fn sort_with_nulls_matches_oracle() -> Result<(), HarnessError> {
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("a".into(), &[Some(3_i32), None, Some(1), Some(5), None, Some(2)]).into(),
+        Series::new("b".into(), &[10_i64, 20, 30, 40, 50, 60]).into(),
+    ])
+    .unwrap_or(DataFrame::empty_with_height(0));
+    let lf = frame.lazy().sort(["a"], Default::default());
+    check_backend_sorted(&lf, all_backends(), &["a"], false)
 }
 
 // ---------------------------------------------------------------------------
