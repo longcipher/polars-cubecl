@@ -47,6 +47,15 @@ pub enum LowerError {
 }
 
 /// A scalar literal in the engine's subset.
+///
+/// # Examples
+///
+/// ```
+/// use polars_cubecl_lower::ScalarLit;
+///
+/// let lit = ScalarLit::I32(42);
+/// assert_eq!(lit, ScalarLit::I32(42));
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalarLit {
     /// 32-bit signed integer literal.
@@ -117,6 +126,22 @@ impl CmpOp {
 /// Kleene `AND`/`OR` coincide with bitwise ops over null-excluding masks,
 /// and negated leaves (`NotCompare` via flipped operators, `NotColumn` via
 /// `!values & validity`) exclude nulls exactly.
+///
+/// # Examples
+///
+/// ```
+/// use polars_core::prelude::PlSmallStr;
+/// use polars_cubecl_buffer::DType;
+/// use polars_cubecl_lower::{CmpOp, Predicate, ScalarLit};
+///
+/// let pred = Predicate::Compare {
+///     column: PlSmallStr::from_static("a"),
+///     kernel_dtype: DType::I32,
+///     op: CmpOp::Gt,
+///     literal: ScalarLit::I32(42),
+/// };
+/// assert_eq!(pred, pred.clone()); // predicates are value-comparable
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub enum Predicate {
     /// `column op literal`, evaluated in `kernel_dtype`.
@@ -993,7 +1018,7 @@ fn float_against_dtype(
 }
 
 const fn f32_is_exact_int(value: f32, raw: i128) -> bool {
-    value as i128 == raw && raw >= -16_777_216 && raw <= 16_777_216
+    value as i128 == raw && raw >= -(1 << 24) && raw <= (1 << 24)
 }
 
 const fn f64_is_exact_int(value: f64, raw: i128) -> bool {
@@ -1002,6 +1027,98 @@ const fn f64_is_exact_int(value: f64, raw: i128) -> bool {
 
 fn unsupported(reason: &str) -> LowerError {
     LowerError::Unsupported { reason: reason.to_string() }
+}
+
+/// Property-based tests for invariants that must hold across randomized
+/// inputs — operator algebra, float-roundtrip boundaries, and the tight
+/// coupling between Polars dtypes and the engine subset.
+#[cfg(test)]
+mod property_tests {
+    use polars_core::datatypes::TimeUnit;
+
+    use super::*;
+
+    /// `f32_is_exact_int` is true exactly for integers whose `f32` bit
+    /// pattern round-trips and that sit within the ±2^24 inclusive range.
+    #[test]
+    fn f32_exact_int_boundary_is_exactly_plus_minus_2_24() {
+        // Inside the boundary: exact representation.
+        assert!(f32_is_exact_int(0.0, 0));
+        assert!(f32_is_exact_int(1.0, 1));
+        assert!(f32_is_exact_int(-1.0, -1));
+        assert!(f32_is_exact_int(16_777_216.0, 16_777_216));
+        assert!(f32_is_exact_int(-16_777_216.0, -16_777_216));
+        // Outside: rejected even when bit-roundtrip coincidentally holds.
+        assert!(!f32_is_exact_int(16_777_217.0, 16_777_217));
+        assert!(!f32_is_exact_int(-16_777_217.0, -16_777_217));
+        assert!(!f32_is_exact_int(16_777_218.0, 16_777_218));
+    }
+
+    /// `f64_is_exact_int` is true exactly for integers whose `f64` bit
+    /// pattern round-trips and that sit within the ±2^53 inclusive range.
+    #[test]
+    fn f64_exact_int_boundary_is_exactly_plus_minus_2_53() {
+        assert!(f64_is_exact_int(0.0, 0));
+        assert!(f64_is_exact_int(9_007_199_254_740_992.0, 9_007_199_254_740_992));
+        assert!(f64_is_exact_int(-9_007_199_254_740_992.0, -9_007_199_254_740_992));
+        // 2^53 + 1 cannot be represented exactly.
+        assert!(!f64_is_exact_int(9_007_199_254_740_993.0, 9_007_199_254_740_993));
+        // 2^53 + 2 is representable but out of range.
+        assert!(!f64_is_exact_int(9_007_199_254_740_994.0, 9_007_199_254_740_994));
+    }
+
+    /// `DType::from_polars` → `to_polars` round-trips for every supported
+    /// dtype; unsupported ones yield `None`.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test asserts supported-dtype invariant")]
+    fn dtype_round_trip_supported_and_rejects_unsupported() {
+        use polars_core::datatypes::DataType::*;
+        for dtype in [Int32, Int64, UInt32, UInt64, Float32, Float64, Boolean] {
+            let engine = DType::from_polars(&dtype).expect("supported dtype should always convert");
+            assert_eq!(engine.to_polars(), dtype, "round-trip failed for {dtype:?}");
+        }
+        for dtype in [String, Null, Date, Datetime(TimeUnit::Microseconds, None)] {
+            assert!(
+                DType::from_polars(&dtype).is_none(),
+                "unsupported dtype {dtype:?} should return None"
+            );
+        }
+    }
+
+    /// `Aggregation::dtype` always mirrors what the CPU oracle produces:
+    /// aggregates that keep the input keep it; `Mean` widens to `f64`;
+    /// `Count`/`Len` yield `UInt32`.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test asserts valid aggregation schema")]
+    fn aggregation_dtype_matches_cpu_semantics() {
+        let arena = Arena::new();
+        let mut builder = Builder::new(&arena);
+        builder.schema = vec![
+            (name("i32"), DataType::Int32),
+            (name("i64"), DataType::Int64),
+            (name("f32"), DataType::Float32),
+            (name("f64"), DataType::Float64),
+            (name("u32"), DataType::UInt32),
+        ];
+        let cases = [
+            (Aggregation::Sum { input: name("i32"), output: name("s") }, DataType::Int32),
+            (Aggregation::Min { input: name("f32"), output: name("m") }, DataType::Float32),
+            (Aggregation::Max { input: name("f64"), output: name("m") }, DataType::Float64),
+            (Aggregation::First { input: name("i64"), output: name("f") }, DataType::Int64),
+            (Aggregation::Last { input: name("u32"), output: name("l") }, DataType::UInt32),
+            (Aggregation::Mean { input: name("i32"), output: name("m") }, DataType::Float64),
+            (Aggregation::Count { input: name("i64"), output: name("c") }, DataType::UInt32),
+            (Aggregation::Len { output: name("n") }, DataType::UInt32),
+        ];
+        for (agg, expected) in cases {
+            let dtype = agg.dtype(&builder).expect("dtype lookup");
+            assert_eq!(dtype, expected, "Aggregation::{:?} should yield {expected:?}", agg);
+        }
+    }
+
+    fn name(value: &str) -> PlSmallStr {
+        PlSmallStr::from(value)
+    }
 }
 
 #[cfg(test)]
@@ -1201,6 +1318,47 @@ mod tests {
         assert!(require_dtype(&DataType::Int32).is_ok());
         assert!(reject_nans(true).is_err());
         assert!(reject_nans(false).is_ok());
+    }
+
+    /// `flip` is an involution: flipping twice returns the original operator.
+    /// This matters because `lower_comparison` tries `flip` as the second
+    /// orientation — a non-involutional `flip` would silently swap operands.
+    #[test]
+    fn cmp_op_flip_is_involution() {
+        for op in [CmpOp::Eq, CmpOp::NotEq, CmpOp::Lt, CmpOp::LtEq, CmpOp::Gt, CmpOp::GtEq] {
+            assert_eq!(op.flip().flip(), op, "flip should be an involution for {op:?}");
+        }
+    }
+
+    /// `negate` is an involution: negating twice returns the original operator.
+    /// Predicate lowering relies on this when pushing `NOT` through leaves.
+    #[test]
+    fn cmp_op_negate_is_involution() {
+        for op in [CmpOp::Eq, CmpOp::NotEq, CmpOp::Lt, CmpOp::LtEq, CmpOp::Gt, CmpOp::GtEq] {
+            assert_eq!(op.negate().negate(), op, "negate should be an involution for {op:?}");
+        }
+    }
+
+    /// `flip` and `negate` commute on symmetric operators (`Eq`/`NotEq`) and
+    /// correctly restate asymmetric ones.
+    #[test]
+    fn cmp_op_flip_matches_negate_duality() {
+        use CmpOp::*;
+        // `Eq` and `NotEq` are symmetric: flip is identity.
+        assert_eq!(Eq.flip(), Eq);
+        assert_eq!(NotEq.flip(), NotEq);
+        // Asymmetric operators flip to their mirror.
+        assert_eq!(Lt.flip(), Gt);
+        assert_eq!(LtEq.flip(), GtEq);
+        assert_eq!(Gt.flip(), Lt);
+        assert_eq!(GtEq.flip(), LtEq);
+        // Negation maps to the complement operator.
+        assert_eq!(Eq.negate(), NotEq);
+        assert_eq!(NotEq.negate(), Eq);
+        assert_eq!(Lt.negate(), GtEq);
+        assert_eq!(LtEq.negate(), Gt);
+        assert_eq!(Gt.negate(), LtEq);
+        assert_eq!(GtEq.negate(), Lt);
     }
 
     #[test]
@@ -1403,6 +1561,80 @@ mod predicate_tests {
         let node = arena.add(AExpr::Column(name("a")));
         let expr = ExprIR::from_node(node, &arena);
         assert_eq!(output_name(&expr), Ok(name("a")));
+    }
+
+    #[test]
+    fn column_against_literal_with_literal_on_left() {
+        // `5 > a` must be lowered as `a < 5` via `flip()`.
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("a")));
+        let literal = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Int(5))));
+        let node = arena.add(AExpr::BinaryExpr { left: literal, op: Operator::Gt, right: column });
+        let builder = pred_builder(&arena);
+        assert_eq!(
+            builder.lower_predicate(node, false),
+            Ok(Predicate::Compare {
+                column: name("a"),
+                kernel_dtype: DType::I32,
+                op: CmpOp::Lt,
+                literal: ScalarLit::I32(5),
+            })
+        );
+    }
+
+    #[test]
+    fn negated_comparison_flips_operator() {
+        // `NOT (a == 1)` should produce `a != 1`.
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("a")));
+        let literal = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Int(1))));
+        let cmp = arena.add(AExpr::BinaryExpr { left: column, op: Operator::Eq, right: literal });
+        let input = ExprIR::from_node(cmp, &arena);
+        let node = arena.add(AExpr::Function {
+            input: vec![input],
+            function: IRFunctionExpr::Boolean(IRBooleanFunction::Not),
+            options: Default::default(),
+        });
+        let builder = pred_builder(&arena);
+        assert_eq!(
+            builder.lower_predicate(node, false),
+            Ok(Predicate::Compare {
+                column: name("a"),
+                kernel_dtype: DType::I32,
+                op: CmpOp::NotEq,
+                literal: ScalarLit::I32(1),
+            })
+        );
+    }
+
+    #[test]
+    fn i64_literal_against_u64_column_lowers() {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("u")));
+        let literal = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Int(3))));
+        let node = arena.add(AExpr::BinaryExpr { left: column, op: Operator::Eq, right: literal });
+        let mut builder = Builder::new(&arena);
+        builder.schema = vec![(name("u"), DataType::UInt64)];
+        assert_eq!(
+            builder.lower_predicate(node, false),
+            Ok(Predicate::Compare {
+                column: name("u"),
+                kernel_dtype: DType::U64,
+                op: CmpOp::Eq,
+                literal: ScalarLit::U64(3),
+            })
+        );
+    }
+
+    #[test]
+    fn f64_literal_against_f32_column_narrows_lossy_is_rejected() {
+        let mut arena = Arena::new();
+        let column = arena.add(AExpr::Column(name("f")));
+        let literal = arena.add(AExpr::Literal(LiteralValue::Dyn(DynLiteralValue::Float(0.1))));
+        let node = arena.add(AExpr::BinaryExpr { left: column, op: Operator::Eq, right: literal });
+        let mut builder = Builder::new(&arena);
+        builder.schema = vec![(name("f"), DataType::Float32)];
+        assert!(builder.lower_predicate(node, false).is_err());
     }
 
     #[test]
@@ -1643,6 +1875,32 @@ mod plan_tests {
             "unexpected error: {error}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn predictate_dtypes_match_kernel_for_all_supported() {
+        // For every supported dtype, DType::from_polars + to_polars round-trips
+        // and every byte-width/dtype variant covers the engine subset exactly.
+        let cases = vec![
+            (DataType::Int32, DType::I32),
+            (DataType::Int64, DType::I64),
+            (DataType::UInt32, DType::U32),
+            (DataType::UInt64, DType::U64),
+            (DataType::Float32, DType::F32),
+            (DataType::Float64, DType::F64),
+            (DataType::Boolean, DType::Bool),
+        ];
+        for (polars_dtype, engine_dtype) in cases {
+            assert_eq!(DType::from_polars(&polars_dtype), Some(engine_dtype));
+            assert_eq!(engine_dtype.to_polars(), polars_dtype);
+        }
+    }
+
+    #[test]
+    fn unsupported_dtypes_are_rejected_in_lower_path() {
+        for dtype in [DataType::String, DataType::Null, DataType::Date] {
+            assert!(require_dtype(&dtype).is_err(), "unsupported dtype {dtype:?} must be rejected");
+        }
     }
 
     fn schema_builder(arena: &Arena<AExpr>) -> Builder<'_> {

@@ -53,6 +53,16 @@ pub enum Backend {
 /// Queries that need `f64` arithmetic must therefore fall back to the CPU
 /// engine there. Bitwise movement (gather/slice) over `f64` data still runs
 /// on device via `u64` kernels — only arithmetic needs true `double`.
+///
+/// # Examples
+///
+/// ```
+/// use polars_cubecl_runtime::{BackendKind, supports_f64};
+///
+/// assert!(supports_f64(BackendKind::Cpu));
+/// assert!(supports_f64(BackendKind::Cuda));
+/// assert!(!supports_f64(BackendKind::MetalNative));
+/// ```
 #[must_use]
 pub const fn supports_f64(kind: BackendKind) -> bool {
     match kind {
@@ -246,5 +256,54 @@ mod tests {
         assert!(!supports_f64(BackendKind::Wgpu));
         #[cfg(not(target_vendor = "apple"))]
         assert!(supports_f64(BackendKind::Wgpu));
+    }
+
+    /// `Backend::Auto` never returns a `NoBackend` when at least one backend
+    /// is linked — `cpu` is always available when its feature is on.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test asserts cpu-linked invariant")]
+    fn auto_never_fails_when_cpu_linked() {
+        #[cfg(feature = "cpu")]
+        {
+            let ctx = RuntimeContext::select(Backend::Auto)
+                .expect("Auto backend selection should always succeed when cpu is linked");
+            // The kind must be one of the linked backends.
+            assert!(RuntimeContext::linked_backends().contains(&ctx.kind()));
+        }
+    }
+
+    /// Selecting `Backend::Cpu` when the `cpu` feature is disabled surfaces a
+    /// typed `NotLinked` error instead of panicking.
+    #[test]
+    fn cpu_reports_not_linked_when_disabled() {
+        #[cfg(not(feature = "cpu"))]
+        {
+            let err =
+                RuntimeContext::select(Backend::Cpu).expect_err("cpu backend should be unlinked");
+            assert_eq!(err, RuntimeError::NotLinked(BackendKind::Cpu));
+        }
+    }
+
+    /// `linked_backends` preserves feature declaration order: GPU-first.
+    #[test]
+    fn linked_backends_order_is_gpu_first() {
+        let backends = RuntimeContext::linked_backends();
+        // Wherever cpu appears, it must be last (lowest priority).
+        if let Some(pos) = backends.iter().position(|b| *b == BackendKind::Cpu) {
+            assert_eq!(pos, backends.len() - 1, "Cpu should be last in backend order");
+        }
+    }
+
+    /// `Debug` output includes the backend kind for diagnostics.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts cpu-linked invariant")]
+    fn debug_includes_backend_kind() {
+        #[cfg(feature = "cpu")]
+        {
+            let ctx = RuntimeContext::select(Backend::Cpu).unwrap();
+            let debug = format!("{ctx:?}");
+            assert!(debug.contains("RuntimeContext"));
+            assert!(debug.contains("Cpu"));
+        }
     }
 }

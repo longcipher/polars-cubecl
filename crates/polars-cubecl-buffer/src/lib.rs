@@ -50,6 +50,17 @@ pub enum BufferError {
 }
 
 /// A dtype in the engine's supported subset.
+///
+/// # Examples
+///
+/// ```
+/// use polars_core::datatypes::DataType;
+/// use polars_cubecl_buffer::DType;
+///
+/// assert_eq!(DType::from_polars(&DataType::Int32), Some(DType::I32));
+/// assert_eq!(DType::from_polars(&DataType::String), None);
+/// assert_eq!(DType::I64.to_polars(), DataType::Int64);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DType {
     /// 32-bit signed integer.
@@ -100,6 +111,19 @@ impl DType {
 }
 
 /// Dense host-side values for one column. Boolean values are `u8`.
+///
+/// # Examples
+///
+/// ```
+/// use polars_cubecl_buffer::HostValues;
+///
+/// let values = HostValues::I32(vec![1, 2, 3]);
+/// assert_eq!(values.len(), 3);
+/// assert!(!values.is_empty());
+///
+/// let empty = HostValues::F64(Vec::new());
+/// assert!(empty.is_empty());
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostValues {
     /// `i32` values.
@@ -497,7 +521,7 @@ where
 #[cfg(test)]
 mod tests {
     use polars_core::prelude::{NamedFrom, Series};
-    use proptest::prop_assert;
+    use proptest::{prop_assert, prop_assert_eq};
 
     use super::*;
 
@@ -666,5 +690,51 @@ mod tests {
             let dense = dense.into_iter().map(u8::from).collect();
             prop_assert!(assert_round_trip(HostValues::Bool(dense), validity).is_ok());
         }
+
+        /// `validity_bitmap` returns `None` iff every entry is non-zero
+        /// (all-valid), and `Some(bitmap)` reproducing the mask otherwise.
+        #[test]
+        fn validity_bitmap_is_none_iff_all_valid(values: Vec<u8>) {
+            let bitmap = validity_bitmap(&values);
+            if values.iter().all(|value| *value != 0) {
+                prop_assert!(bitmap.is_none(), "all-valid validity should yield None");
+            } else {
+                let bitmap = if let Some(bitmap) = bitmap {
+                    bitmap
+                } else {
+                    prop_assert!(false, "any-zero validity should yield Some");
+                    unreachable!()
+                };
+                for (index, value) in values.iter().enumerate() {
+                    prop_assert_eq!(bitmap.get_bit(index), *value != 0);
+                }
+            }
+        }
+
+        /// `non_empty` only replaces empty slices; any non-empty slice is
+        /// returned unchanged (so real column bytes are never padded).
+        #[test]
+        fn non_empty_leaves_nonempty_unchanged(bytes: Vec<u8>) {
+            let result = non_empty(&bytes);
+            if bytes.is_empty() {
+                prop_assert_eq!(result, &[0]);
+            } else {
+                prop_assert_eq!(result, bytes.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn validity_bitmap_all_valid_yields_none() {
+        assert!(validity_bitmap(&[1, 1, 1]).is_none());
+        assert!(validity_bitmap(&[255, 42, 1]).is_none());
+        assert!(validity_bitmap(&[]).is_none(), "empty validity is trivially all-valid");
+    }
+
+    #[test]
+    fn validity_bitmap_any_null_yields_some() {
+        assert!(validity_bitmap(&[1, 0, 1]).is_some());
+        assert!(validity_bitmap(&[0, 0, 0]).is_some());
+        assert!(validity_bitmap(&[0]).is_some());
     }
 }

@@ -890,4 +890,80 @@ mod tests {
         let other = frame_of(vec![Series::new("a".into(), &[2_i32, 1])]);
         assert!(assert_frame_equal(&frame, &other, &rules).is_err());
     }
+
+    #[test]
+    fn signed_zero_matches() {
+        // `-0.0 == 0.0` in IEEE 754; the comparator must agree so that
+        // surfaces that legitimately use `-0.0` (e.g. `floor`) don't false-positive.
+        let rules = CompareRules::default();
+        let frame = frame_of(vec![Series::new("a".into(), &[0.0_f64])]);
+        let other = frame_of(vec![Series::new("a".into(), &[-0.0_f64])]);
+        assert!(assert_frame_equal(&frame, &other, &rules).is_ok());
+    }
+
+    #[test]
+    fn positive_and_negative_infinity_do_not_match() {
+        // The comparator demands exact equality for infinities — a tolerance
+        // would make `+inf` match any huge finite value.
+        let rules = CompareRules::default();
+        let pos_inf = frame_of(vec![Series::new("a".into(), &[f64::INFINITY])]);
+        let neg_inf = frame_of(vec![Series::new("a".into(), &[f64::NEG_INFINITY])]);
+        assert!(matches!(
+            assert_frame_equal(&pos_inf, &neg_inf, &rules),
+            Err(CompareError::Value { .. })
+        ));
+    }
+
+    #[test]
+    fn infinity_matches_itself() {
+        let rules = CompareRules::default();
+        let frame = frame_of(vec![Series::new("a".into(), &[f64::INFINITY])]);
+        let other = frame_of(vec![Series::new("a".into(), &[f64::INFINITY])]);
+        assert!(assert_frame_equal(&frame, &other, &rules).is_ok());
+    }
+
+    #[test]
+    fn nan_does_not_match_infinity() {
+        let rules = CompareRules::default();
+        let nan_frame = frame_of(vec![Series::new("a".into(), &[f64::NAN])]);
+        let inf_frame = frame_of(vec![Series::new("a".into(), &[f64::INFINITY])]);
+        assert!(matches!(
+            assert_frame_equal(&nan_frame, &inf_frame, &rules),
+            Err(CompareError::Value { .. })
+        ));
+    }
+
+    #[test]
+    fn null_vs_value_is_a_null_mismatch() {
+        let rules = CompareRules::default();
+        let frame = frame_of(vec![Series::new("a".into(), &[Some(1_i32)])]);
+        let other = frame_of(vec![Series::new("a".into(), &[None as Option<i32>])]);
+        assert!(matches!(
+            assert_frame_equal(&frame, &other, &rules),
+            Err(CompareError::Null { .. })
+        ));
+    }
+
+    #[test]
+    fn f32_nan_matches_nan() {
+        let rules = CompareRules::default();
+        let frame = frame_of(vec![Series::new("a".into(), &[f32::NAN])]);
+        let other = frame_of(vec![Series::new("a".into(), &[f32::NAN])]);
+        assert!(assert_frame_equal(&frame, &other, &rules).is_ok());
+    }
+
+    #[test]
+    fn mixed_dtype_frame_reports_each_column() {
+        // Two columns with different dtypes: the error must name the
+        // first mismatched column so the user can find it.
+        let rules = CompareRules::default();
+        let frame =
+            frame_of(vec![Series::new("a".into(), &[1_i32]), Series::new("b".into(), &[1_i32])]);
+        let other =
+            frame_of(vec![Series::new("a".into(), &[1_i32]), Series::new("b".into(), &[1_i64])]);
+        assert!(matches!(
+            assert_frame_equal(&frame, &other, &rules),
+            Err(CompareError::DType { column, .. }) if column == "b"
+        ));
+    }
 }

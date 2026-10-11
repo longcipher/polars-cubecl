@@ -107,3 +107,39 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+    #[test]
+    fn filter_u32_threshold_property(
+        values in proptest::collection::vec(proptest::option::of(any::<u32>()), 0..256),
+        threshold in any::<u32>(),
+    ) {
+        for backend in all_backends() {
+            let frame = DataFrame::new_infer_height(vec![
+                Series::new("a".into(), values.clone()).into(),
+            ]).unwrap_or(DataFrame::empty_with_height(0));
+            let lf = frame.lazy().filter(col("a").gt(lit(threshold)));
+            let result = check_backend(&lf, backend, &rules());
+            prop_assert!(result.is_ok(), "backend {backend:?} diverged on u32: {result:?}");
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+    #[test]
+    fn filter_f32_threshold_property(
+        values in proptest::collection::vec(proptest::option::of(any::<f32>()), 0..128),
+        threshold in any::<f32>(),
+    ) {
+        let frame = DataFrame::new_infer_height(vec![
+            Series::new("f".into(), values).into(),
+        ]).unwrap_or(DataFrame::empty_with_height(0));
+        let lf = frame.lazy().filter(col("f").gt(lit(threshold)));
+        for backend in all_backends() {
+            let result = check_backend(&lf, backend, &rules());
+            prop_assert!(result.is_ok(), "backend {backend:?} diverged on f32: {result:?}");
+        }
+    }
+}
