@@ -13,12 +13,12 @@
 use std::sync::Arc;
 
 use polars_core::{
+    chunked_array::ops::sort::options::SortMultipleOptions,
     datatypes::{AnyValue, DataType},
     frame::DataFrame,
     schema::{Schema, SchemaRef},
 };
 use polars_cubecl_buffer::DType;
-use polars_core::chunked_array::ops::sort::options::SortMultipleOptions;
 #[cfg(feature = "parquet")]
 use polars_plan::dsl::ScanSource;
 use polars_plan::{
@@ -190,11 +190,7 @@ pub enum UnaryOp {
 /// // `sin(a + 1)`, where `a` is a plain column.
 /// let expr = Expr::Unary(
 ///     UnaryOp::Sin,
-///     Box::new(Expr::BinOp(
-///         BinOp::Add,
-///         Box::new(Expr::col("a")),
-///         Box::new(Expr::lit_i32(1)),
-///     )),
+///     Box::new(Expr::BinOp(BinOp::Add, Box::new(Expr::col("a")), Box::new(Expr::lit_i32(1)))),
 /// );
 /// assert!(matches!(expr, Expr::Unary(..)));
 /// ```
@@ -672,7 +668,9 @@ impl<'a> Builder<'a> {
             IR::Scan { sources, file_info, predicate, output_schema, scan_type, .. } => {
                 self.lower_scan(sources, file_info, predicate, output_schema, scan_type)?;
             }
-            IR::Cache { input, .. } => { self.lower_node(*input, lp_arena)?; }
+            IR::Cache { input, .. } => {
+                self.lower_node(*input, lp_arena)?;
+            }
             IR::Sort { input, by_column, slice, sort_options } => {
                 self.lower_node(*input, lp_arena)?;
                 // Reject multi-column sort and `maintain_order` for now. Single-key
@@ -849,10 +847,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn apply_projection(
-        &mut self,
-        projection: Vec<(PlSmallStr, Expr)>,
-    ) -> Result<(), LowerError> {
+    fn apply_projection(&mut self, projection: Vec<(PlSmallStr, Expr)>) -> Result<(), LowerError> {
         let mut schema = Vec::with_capacity(projection.len());
         let mut seen = std::collections::HashSet::new();
         for (output, expr) in &projection {
@@ -880,12 +875,7 @@ impl<'a> Builder<'a> {
                 // Comparison operators always yield `Boolean`.
                 if matches!(
                     op,
-                    BinOp::Eq
-                        | BinOp::NotEq
-                        | BinOp::Lt
-                        | BinOp::LtEq
-                        | BinOp::Gt
-                        | BinOp::GtEq
+                    BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
                 ) {
                     return Ok(DataType::Boolean);
                 }
@@ -946,19 +936,17 @@ impl<'a> Builder<'a> {
                 // so the engine cleanly falls back to the CPU.
                 if matches!(
                     op,
-                    UnaryOp::Abs
-                        | UnaryOp::Ceil
-                        | UnaryOp::Floor
-                        | UnaryOp::Exp
-                        | UnaryOp::Sqrt
-                        | UnaryOp::Log1p
-                        | UnaryOp::Sin
-                        | UnaryOp::Cos
-                        | UnaryOp::Sign
-                ) && !matches!(
-                    self.expr_dtype(&inner)?,
-                    DataType::Float32 | DataType::Float64
-                ) {
+                    UnaryOp::Abs |
+                        UnaryOp::Ceil |
+                        UnaryOp::Floor |
+                        UnaryOp::Exp |
+                        UnaryOp::Sqrt |
+                        UnaryOp::Log1p |
+                        UnaryOp::Sin |
+                        UnaryOp::Cos |
+                        UnaryOp::Sign
+                ) && !matches!(self.expr_dtype(&inner)?, DataType::Float32 | DataType::Float64)
+                {
                     return Err(unsupported("float-only math op on non-float column"));
                 }
                 Ok(Expr::Unary(op, Box::new(inner)))
@@ -991,11 +979,9 @@ impl<'a> Builder<'a> {
                 AnyValue::Boolean(raw) => Ok(ScalarLit::Bool(*raw)),
                 _ => Err(unsupported("literal kind outside the subset")),
             },
-            LiteralValue::Dyn(DynLiteralValue::Int(raw)) => {
-                i32::try_from(*raw)
-                    .map(ScalarLit::I32)
-                    .map_err(|_| unsupported("integer literal out of i32 range"))
-            }
+            LiteralValue::Dyn(DynLiteralValue::Int(raw)) => i32::try_from(*raw)
+                .map(ScalarLit::I32)
+                .map_err(|_| unsupported("integer literal out of i32 range")),
             LiteralValue::Dyn(DynLiteralValue::Float(raw)) => Ok(ScalarLit::F64(*raw)),
             _ => Err(unsupported("literal kind outside the subset")),
         }
@@ -2217,12 +2203,14 @@ mod plan_tests {
             (name("y"), Expr::Col(name("f"))),
         ])]);
         // Duplicate outputs and unknown inputs are rejected, not silently kept.
-        assert!(builder
-            .apply_projection(vec![
-                (name("x"), Expr::Col(name("a"))),
-                (name("x"), Expr::Col(name("f"))),
-            ])
-            .is_err());
+        assert!(
+            builder
+                .apply_projection(vec![
+                    (name("x"), Expr::Col(name("a"))),
+                    (name("x"), Expr::Col(name("f"))),
+                ])
+                .is_err()
+        );
         assert!(builder.apply_projection(vec![(name("x"), Expr::Col(name("nope")))]).is_err());
         Ok(())
     }
@@ -2471,11 +2459,7 @@ mod math_fn_tests {
 
     /// Lower and unwrap with a clear panic message on failure.
     #[expect(clippy::expect_used)]
-    fn lower_ok(
-        arena: &mut Arena<AExpr>,
-        function: IRFunctionExpr,
-        column: &str,
-    ) -> Expr {
+    fn lower_ok(arena: &mut Arena<AExpr>, function: IRFunctionExpr, column: &str) -> Expr {
         lower_unary(arena, function, column).expect("lowering should succeed")
     }
 
@@ -2563,11 +2547,7 @@ mod math_fn_tests {
     fn sqrt_lowers_on_float_column() {
         let mut arena = Arena::new();
         assert_eq!(
-            lower_ok(
-                &mut arena,
-                IRFunctionExpr::Pow(polars_plan::plans::IRPowFunction::Sqrt),
-                "f",
-            ),
+            lower_ok(&mut arena, IRFunctionExpr::Pow(polars_plan::plans::IRPowFunction::Sqrt), "f",),
             Expr::Unary(UnaryOp::Sqrt, Box::new(Expr::Col(name("f")))),
         );
     }
@@ -2584,12 +2564,14 @@ mod math_fn_tests {
     #[test]
     fn tangent_is_rejected() {
         let mut arena = Arena::new();
-        assert!(lower_unary(
-            &mut arena,
-            IRFunctionExpr::Trigonometry(polars_plan::plans::IRTrigonometricFunction::Tan),
-            "f",
-        )
-        .is_err());
+        assert!(
+            lower_unary(
+                &mut arena,
+                IRFunctionExpr::Trigonometry(polars_plan::plans::IRTrigonometricFunction::Tan),
+                "f",
+            )
+            .is_err()
+        );
     }
 
     #[test]

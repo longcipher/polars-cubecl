@@ -5,8 +5,7 @@
 //! shapes, and a range of float inputs including ±0, ±inf, NaN, and values
 //! that stress float boundaries.
 
-use std::f64::consts::PI;
-use std::ops::Neg;
+use std::{f64::consts::PI, ops::Neg};
 
 use polars_core::{
     frame::DataFrame,
@@ -14,10 +13,7 @@ use polars_core::{
 };
 use polars_cubecl::Op;
 use polars_cubecl_testing::{CompareRules, all_backends, check_backend, check_quiet_fallback};
-use polars_lazy::{
-    dsl::col,
-    frame::IntoLazy,
-};
+use polars_lazy::{dsl::col, frame::IntoLazy};
 
 fn rules() -> CompareRules {
     CompareRules::default()
@@ -29,11 +25,9 @@ fn rules() -> CompareRules {
 
 #[test]
 fn select_abs_float_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[1.0_f64, -2.5, 0.0, PI, -0.0],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[1.0_f64, -2.5, 0.0, PI, -0.0]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").abs().alias("y")]);
@@ -56,11 +50,10 @@ fn select_abs_float_matches_oracle() -> Result<(), polars_cubecl_testing::Harnes
 
 #[test]
 fn select_ceil_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[1.0_f64, -2.5, 0.0, PI, -0.1, f64::INFINITY, f64::NEG_INFINITY],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[1.0_f64, -2.5, 0.0, PI, -0.1, f64::INFINITY, f64::NEG_INFINITY])
+            .into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").ceil().alias("y")]);
@@ -78,11 +71,9 @@ fn select_ceil_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessErro
 
 #[test]
 fn select_floor_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[1.0_f64, -2.5, 0.0, PI, -0.1],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[1.0_f64, -2.5, 0.0, PI, -0.1]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").floor().alias("y")]);
@@ -100,11 +91,9 @@ fn select_floor_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessErr
 
 #[test]
 fn select_exp_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[0.0_f64, 1.0, -1.0, 2.5, -0.5],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[0.0_f64, 1.0, -1.0, 2.5, -0.5]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").exp().alias("y")]);
@@ -122,11 +111,9 @@ fn select_exp_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError
 
 #[test]
 fn select_log1p_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[0.0_f64, 1.0, -0.5, 2.5, std::f64::consts::E - 1.0],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[0.0_f64, 1.0, -0.5, 2.5, std::f64::consts::E - 1.0]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").log1p().alias("y")]);
@@ -144,11 +131,9 @@ fn select_log1p_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessErr
 
 #[test]
 fn select_sin_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[0.0_f64, PI / 2.0, PI, -PI / 2.0, 1.0],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[0.0_f64, PI / 2.0, PI, -PI / 2.0, 1.0]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").sin().alias("y")]);
@@ -166,11 +151,9 @@ fn select_sin_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError
 
 #[test]
 fn select_cos_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[0.0_f64, PI / 2.0, PI, -PI / 2.0, 1.0],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[0.0_f64, PI / 2.0, PI, -PI / 2.0, 1.0]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").cos().alias("y")]);
@@ -188,11 +171,9 @@ fn select_cos_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError
 
 #[test]
 fn select_sqrt_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[0.0_f64, 1.0, 4.0, 2.25, 100.0],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[0.0_f64, 1.0, 4.0, 2.25, 100.0]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").sqrt().alias("y")]);
@@ -210,11 +191,9 @@ fn select_sqrt_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessErro
 
 #[test]
 fn select_sign_float_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[1.0_f64, -2.5, 0.0, -0.0, f64::NAN],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[1.0_f64, -2.5, 0.0, -0.0, f64::NAN]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").sign().alias("y")]);
@@ -227,17 +206,15 @@ fn select_sign_float_matches_oracle() -> Result<(), polars_cubecl_testing::Harne
 }
 
 #[test]
-fn select_sign_int_matches_oracle_via_fallback() -> Result<(), polars_cubecl_testing::HarnessError> {
+fn select_sign_int_matches_oracle_via_fallback() -> Result<(), polars_cubecl_testing::HarnessError>
+{
     // `sign` over an int column is a float-only math op on a non-float
     // column — the lowering rejects it, and the engine cleanly falls back
     // to CPU.  `check_quiet_fallback` asserts the result is CPU-correct and
     // that the engine did *not* engage.
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[1_i32, -5, 0, 42, -1],
-    )
-    .into()])
-    .unwrap_or(DataFrame::empty_with_height(0));
+    let frame =
+        DataFrame::new_infer_height(vec![Series::new("x".into(), &[1_i32, -5, 0, 42, -1]).into()])
+            .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").sign().alias("y")]);
         let _ = check_quiet_fallback(&lf, backend, &rules())?;
@@ -251,17 +228,11 @@ fn select_sign_int_matches_oracle_via_fallback() -> Result<(), polars_cubecl_tes
 
 #[test]
 fn select_negate_int_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[1_i32, -5, 0, 42],
-    )
-    .into()])
-    .unwrap_or(DataFrame::empty_with_height(0));
+    let frame =
+        DataFrame::new_infer_height(vec![Series::new("x".into(), &[1_i32, -5, 0, 42]).into()])
+            .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
-        let lf = frame
-            .clone()
-            .lazy()
-            .select([col("x").neg().alias("y")]);
+        let lf = frame.clone().lazy().select([col("x").neg().alias("y")]);
         let Some(report) = check_backend(&lf, backend, &rules())? else {
             continue;
         };
@@ -276,17 +247,12 @@ fn select_negate_int_matches_oracle() -> Result<(), polars_cubecl_testing::Harne
 
 #[test]
 fn select_nested_sin_abs_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[0.0_f64, -1.0, 2.5, -PI],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[0.0_f64, -1.0, 2.5, -PI]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
-        let lf = frame
-            .clone()
-            .lazy()
-            .select([col("x").abs().sin().alias("y")]);
+        let lf = frame.clone().lazy().select([col("x").abs().sin().alias("y")]);
         let Some(report) = check_backend(&lf, backend, &rules())? else {
             continue;
         };
@@ -312,10 +278,7 @@ fn select_math_plus_arithmetic_matches_oracle() -> Result<(), polars_cubecl_test
         let lf = frame
             .clone()
             .lazy()
-            .select([
-                col("a").abs().alias("abs_a"),
-                (col("a").abs() + col("b")).alias("sum"),
-            ]);
+            .select([col("a").abs().alias("abs_a"), (col("a").abs() + col("b")).alias("sum")]);
         let Some(report) = check_backend(&lf, backend, &rules())? else {
             continue;
         };
@@ -330,11 +293,9 @@ fn select_math_plus_arithmetic_matches_oracle() -> Result<(), polars_cubecl_test
 
 #[test]
 fn select_abs_with_nulls_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
-    let frame = DataFrame::new_infer_height(vec![Series::new(
-        "x".into(),
-        &[Some(1.0_f64), None, Some(-2.5), None, Some(0.0)],
-    )
-    .into()])
+    let frame = DataFrame::new_infer_height(vec![
+        Series::new("x".into(), &[Some(1.0_f64), None, Some(-2.5), None, Some(0.0)]).into(),
+    ])
     .unwrap_or(DataFrame::empty_with_height(0));
     for backend in all_backends() {
         let lf = frame.clone().lazy().select([col("x").abs().alias("y")]);

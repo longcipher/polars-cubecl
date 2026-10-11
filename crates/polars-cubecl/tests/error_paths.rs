@@ -112,7 +112,6 @@ fn non_strict_mode_sort_engages_and_is_cpu_correct() {
 }
 
 #[test]
-#[expect(clippy::expect_used, reason = "test asserts sorted correctness")]
 fn sort_i64_matches_oracle() -> Result<(), HarnessError> {
     let frame = DataFrame::new_infer_height(vec![
         Series::new("a".into(), &[3_i64, 1, 4, 1, 5, 9, 2, 6]).into(),
@@ -127,7 +126,6 @@ fn sort_i64_matches_oracle() -> Result<(), HarnessError> {
 }
 
 #[test]
-#[expect(clippy::expect_used, reason = "test asserts sorted correctness with nulls")]
 fn sort_with_nulls_matches_oracle() -> Result<(), HarnessError> {
     let frame = DataFrame::new_infer_height(vec![
         Series::new("a".into(), &[Some(3_i32), None, Some(1), Some(5), None, Some(2)]).into(),

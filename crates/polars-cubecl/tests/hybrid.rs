@@ -84,11 +84,9 @@ fn fully_unsupported_plan_still_falls_back() -> Result<(), HarnessError> {
             Series::new("v".into(), &[Some(70_i64), Some(80)]).into(),
         ])
         .unwrap_or(DataFrame::empty_with_height(0));
-        let lf = concat(
-            [int_frame().lazy(), other.lazy()],
-            polars_lazy::prelude::UnionArgs::default(),
-        )
-        .expect("concat build failed");
+        let lf =
+            concat([int_frame().lazy(), other.lazy()], polars_lazy::prelude::UnionArgs::default())
+                .expect("concat build failed");
         let _ = check_fallback_backend(&lf, backend, &rules())?;
     }
     Ok(())

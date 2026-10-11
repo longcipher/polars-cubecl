@@ -14,8 +14,13 @@ use polars_core::frame::DataFrame;
 use polars_cubecl_buffer::{
     BufferError, DType, DeviceColumn, download, download_frame, series_to_host, upload,
 };
-use polars_cubecl_kernels::{KernelError, launch_cast_i32_to_f64, launch_cast_u32_to_f64, BinOp as KernelBinOp, CmpOp as KernelCmpOp, UnaryOp as KernelUnaryOp};
-use polars_cubecl_lower::{BinOp, CmpOp, CubePlan, Expr, PlanOp, PlanSource, Predicate, ScalarLit, UnaryOp};
+use polars_cubecl_kernels::{
+    BinOp as KernelBinOp, CmpOp as KernelCmpOp, KernelError, UnaryOp as KernelUnaryOp,
+    launch_cast_i32_to_f64, launch_cast_u32_to_f64,
+};
+use polars_cubecl_lower::{
+    BinOp, CmpOp, CubePlan, Expr, PlanOp, PlanSource, Predicate, ScalarLit, UnaryOp,
+};
 use polars_cubecl_runtime::{RuntimeContext, supports_f64};
 use polars_utils::pl_str::PlSmallStr;
 use thiserror::Error;
@@ -193,18 +198,16 @@ fn eval_expr(
             Ok(columns[index].clone())
         }
         Expr::Lit(lit) => eval_literal(client, *lit, height),
-        Expr::BinOp(op, left, right) => eval_binop(client, f64_ok, columns, *op, left, right, height),
+        Expr::BinOp(op, left, right) => {
+            eval_binop(client, f64_ok, columns, *op, left, right, height)
+        }
         Expr::Unary(op, inner) => eval_unary(client, f64_ok, columns, *op, inner, height),
     }
 }
 
 /// Materialize a scalar literal into a full device column: every row holds
 /// the literal value, and the validity mask is all-valid.
-fn eval_literal(
-    client: &Client,
-    lit: ScalarLit,
-    height: usize,
-) -> Result<DeviceColumn, ExecError> {
+fn eval_literal(client: &Client, lit: ScalarLit, height: usize) -> Result<DeviceColumn, ExecError> {
     let dtype = match lit {
         ScalarLit::I32(_) => DType::I32,
         ScalarLit::I64(_) => DType::I64,
@@ -221,17 +224,10 @@ fn eval_literal(
     for _ in 0..height {
         value_bytes.extend_from_slice(&raw);
     }
-    let values = client.create_from_slice(if value_bytes.is_empty() {
-        &[0]
-    } else {
-        &value_bytes
-    });
+    let values = client.create_from_slice(if value_bytes.is_empty() { &[0] } else { &value_bytes });
     let validity_bytes = vec![1_u8; height];
-    let validity = client.create_from_slice(if validity_bytes.is_empty() {
-        &[0]
-    } else {
-        &validity_bytes
-    });
+    let validity =
+        client.create_from_slice(if validity_bytes.is_empty() { &[0] } else { &validity_bytes });
     Ok(DeviceColumn::from_handles(PlSmallStr::from_static(""), dtype, values, validity, height))
 }
 
@@ -262,10 +258,7 @@ fn eval_binop(
     let rhs = eval_expr(client, f64_ok, columns, right, height)?;
 
     // Comparisons always yield `Bool`.
-    if matches!(
-        op,
-        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
-    ) {
+    if matches!(op, BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq) {
         return eval_col_cmp(client, f64_ok, &lhs, &rhs, cmp_op(op), height);
     }
 
@@ -300,8 +293,15 @@ fn eval_unary(
 
     // Float-only math functions require float dtypes.
     match op {
-        UnaryOp::Abs | UnaryOp::Ceil | UnaryOp::Floor | UnaryOp::Exp |
-        UnaryOp::Sqrt | UnaryOp::Log1p | UnaryOp::Sin | UnaryOp::Cos | UnaryOp::Sign => {
+        UnaryOp::Abs |
+        UnaryOp::Ceil |
+        UnaryOp::Floor |
+        UnaryOp::Exp |
+        UnaryOp::Sqrt |
+        UnaryOp::Log1p |
+        UnaryOp::Sin |
+        UnaryOp::Cos |
+        UnaryOp::Sign => {
             if !matches!(dtype, DType::F32 | DType::F64) {
                 return Err(ExecError::NotExecutable(format!(
                     "{op:?} requires a float dtype, got {dtype:?}",
@@ -311,9 +311,7 @@ fn eval_unary(
         UnaryOp::Negate => {}
     }
     if dtype == DType::F64 && !f64_ok {
-        return Err(ExecError::BackendUnsupported(
-            "f64 unary op needs double support".to_string(),
-        ));
+        return Err(ExecError::BackendUnsupported("f64 unary op needs double support".to_string()));
     }
 
     let out = alloc(client, height.saturating_mul(dtype_size(dtype)));
@@ -361,32 +359,76 @@ fn dispatch_binop(
 ) -> Result<(), ExecError> {
     match dtype {
         DType::I32 => polars_cubecl_kernels::launch_binop::<i32>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::I64 => polars_cubecl_kernels::launch_binop::<i64>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::U32 => polars_cubecl_kernels::launch_binop::<u32>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::U64 => polars_cubecl_kernels::launch_binop::<u64>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::F32 => polars_cubecl_kernels::launch_binop_f32(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::F64 => polars_cubecl_kernels::launch_binop_f64(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
-        DType::Bool => return Err(ExecError::NotExecutable(
-            "binary arithmetic on boolean not supported".to_string(),
-        )),
+        DType::Bool => {
+            return Err(ExecError::NotExecutable(
+                "binary arithmetic on boolean not supported".to_string(),
+            ))
+        }
     }
     Ok(())
 }
@@ -403,32 +445,62 @@ fn dispatch_unaryop(
 ) -> Result<(), ExecError> {
     match dtype {
         DType::I32 => polars_cubecl_kernels::launch_unaryop::<i32>(
-            client, input.values(), input.validity(),
-            out, out_valid, height, op,
+            client,
+            input.values(),
+            input.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::I64 => polars_cubecl_kernels::launch_unaryop::<i64>(
-            client, input.values(), input.validity(),
-            out, out_valid, height, op,
+            client,
+            input.values(),
+            input.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::U32 => polars_cubecl_kernels::launch_unaryop::<u32>(
-            client, input.values(), input.validity(),
-            out, out_valid, height, op,
+            client,
+            input.values(),
+            input.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::U64 => polars_cubecl_kernels::launch_unaryop::<u64>(
-            client, input.values(), input.validity(),
-            out, out_valid, height, op,
+            client,
+            input.values(),
+            input.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::F32 => polars_cubecl_kernels::launch_unaryop_f32(
-            client, input.values(), input.validity(),
-            out, out_valid, height, op,
+            client,
+            input.values(),
+            input.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::F64 => polars_cubecl_kernels::launch_unaryop_f64(
-            client, input.values(), input.validity(),
-            out, out_valid, height, op,
+            client,
+            input.values(),
+            input.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
-        DType::Bool => return Err(ExecError::NotExecutable(
-            "unary ops on boolean not supported".to_string(),
-        )),
+        DType::Bool => {
+            return Err(ExecError::NotExecutable("unary ops on boolean not supported".to_string()))
+        }
     }
     Ok(())
 }
@@ -446,32 +518,81 @@ fn dispatch_col_cmp(
 ) -> Result<(), ExecError> {
     match dtype {
         DType::I32 => polars_cubecl_kernels::launch_col_cmp::<i32>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::I64 => polars_cubecl_kernels::launch_col_cmp::<i64>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::U32 => polars_cubecl_kernels::launch_col_cmp::<u32>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::U64 => polars_cubecl_kernels::launch_col_cmp::<u64>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::F32 => polars_cubecl_kernels::launch_col_cmp_f32(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::F64 => polars_cubecl_kernels::launch_col_cmp_f64(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
         DType::Bool => polars_cubecl_kernels::launch_col_cmp::<u8>(
-            client, lhs.values(), lhs.validity(), rhs.values(), rhs.validity(),
-            out, out_valid, height, op,
+            client,
+            lhs.values(),
+            lhs.validity(),
+            rhs.values(),
+            rhs.validity(),
+            out,
+            out_valid,
+            height,
+            op,
         )?,
     }
     Ok(())
@@ -525,14 +646,22 @@ fn maybe_cast(
             let out = alloc(client, column.len() * 8);
             launch_cast_i32_to_f64(client, column.values(), &out, column.len())?;
             Ok(DeviceColumn::from_handles(
-                column.name().clone(), target, out, column.validity().clone(), column.len(),
+                column.name().clone(),
+                target,
+                out,
+                column.validity().clone(),
+                column.len(),
             ))
         }
         (DType::U32, DType::F64) => {
             let out = alloc(client, column.len() * 8);
             launch_cast_u32_to_f64(client, column.values(), &out, column.len())?;
             Ok(DeviceColumn::from_handles(
-                column.name().clone(), target, out, column.validity().clone(), column.len(),
+                column.name().clone(),
+                target,
+                out,
+                column.validity().clone(),
+                column.len(),
             ))
         }
         _ => Err(ExecError::Inconsistent(format!(
@@ -724,25 +853,39 @@ fn sort_permutation(
     // equal keys, which is what Polars `sort` promises.
     match values {
         polars_cubecl_buffer::HostValues::I32(v) => {
-            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+            permutation.sort_by(|a, b| {
+                compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last)
+            });
         }
         polars_cubecl_buffer::HostValues::I64(v) => {
-            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+            permutation.sort_by(|a, b| {
+                compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last)
+            });
         }
         polars_cubecl_buffer::HostValues::U32(v) => {
-            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+            permutation.sort_by(|a, b| {
+                compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last)
+            });
         }
         polars_cubecl_buffer::HostValues::U64(v) => {
-            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+            permutation.sort_by(|a, b| {
+                compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last)
+            });
         }
         polars_cubecl_buffer::HostValues::F32(v) => {
-            permutation.sort_by(|a, b| compare_keys_f32(v, validity, *a as usize, *b as usize, descending, nulls_last));
+            permutation.sort_by(|a, b| {
+                compare_keys_f32(v, validity, *a as usize, *b as usize, descending, nulls_last)
+            });
         }
         polars_cubecl_buffer::HostValues::F64(v) => {
-            permutation.sort_by(|a, b| compare_keys_f64(v, validity, *a as usize, *b as usize, descending, nulls_last));
+            permutation.sort_by(|a, b| {
+                compare_keys_f64(v, validity, *a as usize, *b as usize, descending, nulls_last)
+            });
         }
         polars_cubecl_buffer::HostValues::Bool(v) => {
-            permutation.sort_by(|a, b| compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last));
+            permutation.sort_by(|a, b| {
+                compare_keys(v, validity, *a as usize, *b as usize, descending, nulls_last)
+            });
         }
     }
 }
@@ -776,11 +919,7 @@ fn compare_keys<T: Ord>(
             }
         }
     };
-    if descending {
-        base.reverse()
-    } else {
-        base
-    }
+    if descending { base.reverse() } else { base }
 }
 
 /// Float comparison that matches Polars' sort ordering: `NaN` sorts after
@@ -843,11 +982,7 @@ where
             }
         }
     };
-    if descending {
-        base.reverse()
-    } else {
-        base
-    }
+    if descending { base.reverse() } else { base }
 }
 
 /// Map an `f64` to a `u64` key that sorts in the same order as Polars'
@@ -859,11 +994,7 @@ fn float_sort_ord(value: f64) -> u64 {
     let bits = value.to_bits();
     // Flip the sign bit and, for negatives, the rest of the bits as well
     // (IEEE 754 trick to make the bit pattern sort as unsigned == float order).
-    if bits >> 63 == 1 {
-        !bits
-    } else {
-        bits ^ (1 << 63)
-    }
+    if bits >> 63 == 1 { !bits } else { bits ^ (1 << 63) }
 }
 
 fn eval_predicate(

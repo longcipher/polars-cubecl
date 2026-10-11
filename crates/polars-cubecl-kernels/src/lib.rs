@@ -890,40 +890,70 @@ pub fn launch_binop<T: Numeric>(
     unsafe {
         match op {
             BinOp::Add => inner::binop_add_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Sub => inner::binop_sub_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Mul => inner::binop_mul_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Div => inner::binop_div_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::FloorDiv => inner::binop_floordiv_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Mod => inner::binop_mod_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -947,40 +977,70 @@ pub fn launch_binop_f32(
     unsafe {
         match op {
             BinOp::Add => inner::binop_f32_add_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Sub => inner::binop_f32_sub_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Mul => inner::binop_f32_mul_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Div => inner::binop_f32_div_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::FloorDiv => inner::binop_f32_floordiv_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Mod => inner::binop_f32_mod_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -1004,40 +1064,70 @@ pub fn launch_binop_f64(
     unsafe {
         match op {
             BinOp::Add => inner::binop_f64_add_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Sub => inner::binop_f64_sub_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Mul => inner::binop_f64_mul_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Div => inner::binop_f64_div_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::FloorDiv => inner::binop_f64_floordiv_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             BinOp::Mod => inner::binop_f64_mod_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -1061,22 +1151,39 @@ pub fn launch_unaryop<T: Numeric>(
     unsafe {
         match op {
             UnaryOp::Abs => inner::unary_abs_kernel::launch::<T>(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Sign => inner::unary_sign_kernel::launch::<T>(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Negate => inner::unary_negate_kernel::launch::<T>(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
-            UnaryOp::Ceil | UnaryOp::Floor | UnaryOp::Exp | UnaryOp::Sqrt
-            | UnaryOp::Log1p | UnaryOp::Sin | UnaryOp::Cos => {
+            UnaryOp::Ceil |
+            UnaryOp::Floor |
+            UnaryOp::Exp |
+            UnaryOp::Sqrt |
+            UnaryOp::Log1p |
+            UnaryOp::Sin |
+            UnaryOp::Cos => {
                 return Err(KernelError::RowCount); // Should be dispatched as float.
             }
         }
@@ -1099,54 +1206,94 @@ pub fn launch_unaryop_f32(
     unsafe {
         match op {
             UnaryOp::Abs => inner::unary_f32_abs_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Ceil => inner::unary_f32_ceil_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Floor => inner::unary_f32_floor_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Exp => inner::unary_f32_exp_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Sqrt => inner::unary_f32_sqrt_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Log1p => inner::unary_f32_log1p_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Sin => inner::unary_f32_sin_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Cos => inner::unary_f32_cos_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Sign => inner::unary_f32_sign_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Negate => inner::unary_f32_negate_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -1168,54 +1315,94 @@ pub fn launch_unaryop_f64(
     unsafe {
         match op {
             UnaryOp::Abs => inner::unary_f64_abs_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Ceil => inner::unary_f64_ceil_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Floor => inner::unary_f64_floor_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Exp => inner::unary_f64_exp_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Sqrt => inner::unary_f64_sqrt_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Log1p => inner::unary_f64_log1p_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Sin => inner::unary_f64_sin_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Cos => inner::unary_f64_cos_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Sign => inner::unary_f64_sign_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             UnaryOp::Negate => inner::unary_f64_negate_kernel::launch(
-                client, count, dim,
-                wrap(input, height), wrap(input_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(input, height),
+                wrap(input_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -1241,40 +1428,70 @@ pub fn launch_col_cmp<T: Numeric>(
     unsafe {
         match op {
             CmpOp::Eq => inner::col_cmp_eq_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::NotEq => inner::col_cmp_ne_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::Lt => inner::col_cmp_lt_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::LtEq => inner::col_cmp_le_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::Gt => inner::col_cmp_gt_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::GtEq => inner::col_cmp_ge_kernel::launch::<T>(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -1298,40 +1515,70 @@ pub fn launch_col_cmp_f32(
     unsafe {
         match op {
             CmpOp::Eq => inner::col_cmp_f32_eq_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::NotEq => inner::col_cmp_f32_ne_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::Lt => inner::col_cmp_f32_lt_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::LtEq => inner::col_cmp_f32_le_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::Gt => inner::col_cmp_f32_gt_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::GtEq => inner::col_cmp_f32_ge_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -1355,40 +1602,70 @@ pub fn launch_col_cmp_f64(
     unsafe {
         match op {
             CmpOp::Eq => inner::col_cmp_f64_eq_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::NotEq => inner::col_cmp_f64_ne_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::Lt => inner::col_cmp_f64_lt_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::LtEq => inner::col_cmp_f64_le_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::Gt => inner::col_cmp_f64_gt_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
             CmpOp::GtEq => inner::col_cmp_f64_ge_kernel::launch(
-                client, count, dim,
-                wrap(lhs, height), wrap(lhs_valid, height),
-                wrap(rhs, height), wrap(rhs_valid, height),
-                wrap(out, height), wrap(out_valid, height),
+                client,
+                count,
+                dim,
+                wrap(lhs, height),
+                wrap(lhs_valid, height),
+                wrap(rhs, height),
+                wrap(rhs_valid, height),
+                wrap(out, height),
+                wrap(out_valid, height),
             ),
         }
     }
@@ -2259,8 +2536,8 @@ mod inner {
                 let q = lhs[row] / rhs[row];
                 let r = lhs[row] % rhs[row];
                 // Floor correction: when signs differ and remainder != 0.
-                if r != T::from_int(0)
-                    && ((lhs[row] < T::from_int(0)) != (rhs[row] < T::from_int(0)))
+                if r != T::from_int(0) &&
+                    ((lhs[row] < T::from_int(0)) != (rhs[row] < T::from_int(0)))
                 {
                     out[row] = q - T::from_int(1);
                 } else {
@@ -2521,12 +2798,7 @@ mod inner {
     macro_rules! unary_f32_unary_kernel {
         ($name:ident, $method:ident) => {
             #[cube(launch)]
-            pub fn $name(
-                input: &[f32],
-                input_valid: &[u8],
-                out: &mut [f32],
-                out_valid: &mut [u8],
-            ) {
+            pub fn $name(input: &[f32], input_valid: &[u8], out: &mut [f32], out_valid: &mut [u8]) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if input_valid[row] != 0u8 {
@@ -2618,12 +2890,7 @@ mod inner {
     macro_rules! unary_f64_unary_kernel {
         ($name:ident, $method:ident) => {
             #[cube(launch)]
-            pub fn $name(
-                input: &[f64],
-                input_valid: &[u8],
-                out: &mut [f64],
-                out_valid: &mut [u8],
-            ) {
+            pub fn $name(input: &[f64], input_valid: &[u8], out: &mut [f64], out_valid: &mut [u8]) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if input_valid[row] != 0u8 {
@@ -2755,7 +3022,14 @@ mod inner {
     macro_rules! col_cmp_float_kernel {
         ($name:ident, $ty:ty, Eq) => {
             #[cube(launch)]
-            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+            pub fn $name(
+                lhs: &[$ty],
+                lhs_valid: &[u8],
+                rhs: &[$ty],
+                rhs_valid: &[u8],
+                out: &mut [u8],
+                out_valid: &mut [u8],
+            ) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
@@ -2774,7 +3048,14 @@ mod inner {
         };
         ($name:ident, $ty:ty, NotEq) => {
             #[cube(launch)]
-            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+            pub fn $name(
+                lhs: &[$ty],
+                lhs_valid: &[u8],
+                rhs: &[$ty],
+                rhs_valid: &[u8],
+                out: &mut [u8],
+                out_valid: &mut [u8],
+            ) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
@@ -2793,7 +3074,14 @@ mod inner {
         };
         ($name:ident, $ty:ty, Lt) => {
             #[cube(launch)]
-            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+            pub fn $name(
+                lhs: &[$ty],
+                lhs_valid: &[u8],
+                rhs: &[$ty],
+                rhs_valid: &[u8],
+                out: &mut [u8],
+                out_valid: &mut [u8],
+            ) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
@@ -2810,7 +3098,14 @@ mod inner {
         };
         ($name:ident, $ty:ty, LtEq) => {
             #[cube(launch)]
-            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+            pub fn $name(
+                lhs: &[$ty],
+                lhs_valid: &[u8],
+                rhs: &[$ty],
+                rhs_valid: &[u8],
+                out: &mut [u8],
+                out_valid: &mut [u8],
+            ) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
@@ -2828,7 +3123,14 @@ mod inner {
         };
         ($name:ident, $ty:ty, Gt) => {
             #[cube(launch)]
-            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+            pub fn $name(
+                lhs: &[$ty],
+                lhs_valid: &[u8],
+                rhs: &[$ty],
+                rhs_valid: &[u8],
+                out: &mut [u8],
+                out_valid: &mut [u8],
+            ) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {
@@ -2845,7 +3147,14 @@ mod inner {
         };
         ($name:ident, $ty:ty, GtEq) => {
             #[cube(launch)]
-            pub fn $name(lhs: &[$ty], lhs_valid: &[u8], rhs: &[$ty], rhs_valid: &[u8], out: &mut [u8], out_valid: &mut [u8]) {
+            pub fn $name(
+                lhs: &[$ty],
+                lhs_valid: &[u8],
+                rhs: &[$ty],
+                rhs_valid: &[u8],
+                out: &mut [u8],
+                out_valid: &mut [u8],
+            ) {
                 let row = ABSOLUTE_POS;
                 if row < out.len() {
                     if lhs_valid[row] != 0u8 && rhs_valid[row] != 0u8 {

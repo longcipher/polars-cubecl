@@ -53,6 +53,10 @@ fn_params_excessive_bools = "allow" # Sometimes functions legitimately need mult
 items_after_statements = "allow"    # Style preference, not harmful
 uninlined_format_args = "allow"     # format!("{}", x) vs format!("{x}") is minor
 return_self_not_must_use = "allow"  # Builder pattern returns
+unused_self = "allow"               # Nightly clippy addition
+too_many_arguments = "allow"        # Pedantic
+bool_to_int_with_if = "allow"       # Pedantic
+single_element_loop = "allow"       # Pedantic
 
 # Cast lints - many false positives in contexts where values are known to be in range
 cast_possible_truncation = "allow"
@@ -117,14 +121,14 @@ print_stderr = "deny"
 # assume they don't have that many false positives. Let's enable them to
 # prevent future problems.
 borrow_as_ptr = "warn"
-branches_sharing_code = "warn"
+branches_sharing_code = "allow"
 clear_with_drain = "warn"
 cloned_instead_of_copied = "warn"
 collection_is_never_read = "warn"
 derive_partial_eq_without_eq = "warn"
 empty_line_after_doc_comments = "warn"
 empty_line_after_outer_attr = "warn"
-enum_glob_use = "warn"
+enum_glob_use = "allow"
 equatable_if_let = "warn"
 explicit_into_iter_loop = "warn"
 explicit_iter_loop = "warn"
@@ -142,7 +146,7 @@ manual_assert = "warn"
 manual_clamp = "warn"
 manual_is_variant_and = "warn"
 manual_string_new = "warn"
-missing_const_for_fn = "warn"
+missing_const_for_fn = "allow"
 mutex_integer = "warn"
 naive_bytecount = "warn"
 needless_bitwise_bool = "warn"
@@ -159,7 +163,7 @@ redundant_else = "warn"
 single_char_pattern = "warn"
 string_lit_as_bytes = "warn"
 string_lit_chars_any = "warn"
-suboptimal_flops = "warn"
+suboptimal_flops = "allow"
 suspicious_operation_groupings = "warn"
 trailing_empty_array = "warn"
 trait_duplication_in_bounds = "warn"

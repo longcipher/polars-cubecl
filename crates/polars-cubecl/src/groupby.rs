@@ -449,9 +449,7 @@ fn reduce_agg(
                 seg.num_groups,
             ))
         }
-        Aggregation::Median { input, output } => {
-            reduce_median(client, columns, input, output, seg)
-        }
+        Aggregation::Median { input, output } => reduce_median(client, columns, input, output, seg),
         Aggregation::Len { output } => {
             let out_values = create_slice(client, bytemuck::cast_slice(&grouping.sizes));
             let ones = vec![1_u8; seg.num_groups];
@@ -935,15 +933,12 @@ fn reduce_median(
     let host = download(client, source)?;
 
     // Read raw slot/segment data from device handles.
-    let slots_bytes = client
-        .read_one(seg.slots.clone())
-        .map_err(|e| ExecError::Launch(e.to_string()))?;
-    let seg_off_bytes = client
-        .read_one(seg.seg_off.clone())
-        .map_err(|e| ExecError::Launch(e.to_string()))?;
-    let seg_len_bytes = client
-        .read_one(seg.seg_len.clone())
-        .map_err(|e| ExecError::Launch(e.to_string()))?;
+    let slots_bytes =
+        client.read_one(seg.slots.clone()).map_err(|e| ExecError::Launch(e.to_string()))?;
+    let seg_off_bytes =
+        client.read_one(seg.seg_off.clone()).map_err(|e| ExecError::Launch(e.to_string()))?;
+    let seg_len_bytes =
+        client.read_one(seg.seg_len.clone()).map_err(|e| ExecError::Launch(e.to_string()))?;
     let slots_u32: &[u32] = bytemuck::cast_slice(&slots_bytes);
     let seg_off: &[u32] = bytemuck::cast_slice(&seg_off_bytes);
     let seg_len: &[u32] = bytemuck::cast_slice(&seg_len_bytes);
@@ -983,11 +978,8 @@ fn reduce_median(
         }
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = vals.len();
-        let median = if n % 2 == 1 {
-            vals[n / 2]
-        } else {
-            (vals[n / 2 - 1] + vals[n / 2]) / 2.0
-        };
+        let median =
+            if n % 2 == 1 { vals[n / 2] } else { f64::midpoint(vals[n / 2 - 1], vals[n / 2]) };
         out_vals[group] = median;
         out_valid[group] = 1;
     }
@@ -996,5 +988,11 @@ fn reduce_median(
     let out_valid_buf = create_slice(client, &out_valid);
     let out_values_buf = create_slice(client, bytemuck::cast_slice(&out_vals));
 
-    Ok(DeviceColumn::from_handles(output.clone(), DType::F64, out_values_buf, out_valid_buf, seg.num_groups))
+    Ok(DeviceColumn::from_handles(
+        output.clone(),
+        DType::F64,
+        out_values_buf,
+        out_valid_buf,
+        seg.num_groups,
+    ))
 }
