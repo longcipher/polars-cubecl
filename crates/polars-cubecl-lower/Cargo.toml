@@ -10,7 +10,7 @@ parquet = ["polars-plan/parquet"]
 
 [dependencies]
 polars-core = { workspace = true }
-polars-cubecl-buffer = { version = "0.1.0", path = "../polars-cubecl-buffer" }
+polars-cubecl-buffer = { version = "0.2.0", path = "../polars-cubecl-buffer" }
 polars-plan = { workspace = true }
 polars-utils = { workspace = true }
 thiserror = { workspace = true }

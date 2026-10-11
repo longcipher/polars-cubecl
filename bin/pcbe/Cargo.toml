@@ -20,7 +20,7 @@ clap = { workspace = true, features = ["derive"] }
 eyre = { workspace = true }
 polars-config = { workspace = true }
 polars-core = { workspace = true }
-polars-cubecl = { version = "0.1.0", path = "../../crates/polars-cubecl" }
+polars-cubecl = { version = "0.2.0", path = "../../crates/polars-cubecl" }
 polars-lazy = { workspace = true }
 polars-utils = { workspace = true }
 
