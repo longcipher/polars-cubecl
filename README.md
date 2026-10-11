@@ -18,7 +18,7 @@ correctness strategy, and [`docs/roadmap.md`](docs/roadmap.md) for milestones.
 
 | Dependency | Pinned version | Reason |
 | --- | --- | --- |
-| `polars` family | `=0.55.1` | Internal IR; must match exactly |
+| `polars` family | `=0.55.2` | Internal IR; must match exactly |
 | `cubecl` family | `=0.11.0` | Pre-1.0 API churn |
 | Rust toolchain | nightly (see `rust-toolchain.toml`) | workspace lints |
 

@@ -31,7 +31,7 @@ fn rules() -> CompareRules {
 fn select_abs_float_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
     let frame = DataFrame::new_infer_height(vec![Series::new(
         "x".into(),
-        &[1.0_f64, -2.5, 0.0, 3.14, -0.0],
+        &[1.0_f64, -2.5, 0.0, PI, -0.0],
     )
     .into()])
     .unwrap_or(DataFrame::empty_with_height(0));
@@ -58,7 +58,7 @@ fn select_abs_float_matches_oracle() -> Result<(), polars_cubecl_testing::Harnes
 fn select_ceil_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
     let frame = DataFrame::new_infer_height(vec![Series::new(
         "x".into(),
-        &[1.0_f64, -2.5, 0.0, 3.14, -0.1, f64::INFINITY, f64::NEG_INFINITY],
+        &[1.0_f64, -2.5, 0.0, PI, -0.1, f64::INFINITY, f64::NEG_INFINITY],
     )
     .into()])
     .unwrap_or(DataFrame::empty_with_height(0));
@@ -80,7 +80,7 @@ fn select_ceil_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessErro
 fn select_floor_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
     let frame = DataFrame::new_infer_height(vec![Series::new(
         "x".into(),
-        &[1.0_f64, -2.5, 0.0, 3.14, -0.1],
+        &[1.0_f64, -2.5, 0.0, PI, -0.1],
     )
     .into()])
     .unwrap_or(DataFrame::empty_with_height(0));
@@ -278,7 +278,7 @@ fn select_negate_int_matches_oracle() -> Result<(), polars_cubecl_testing::Harne
 fn select_nested_sin_abs_matches_oracle() -> Result<(), polars_cubecl_testing::HarnessError> {
     let frame = DataFrame::new_infer_height(vec![Series::new(
         "x".into(),
-        &[0.0_f64, -1.0, 2.5, -3.14],
+        &[0.0_f64, -1.0, 2.5, -PI],
     )
     .into()])
     .unwrap_or(DataFrame::empty_with_height(0));

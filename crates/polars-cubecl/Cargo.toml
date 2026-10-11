@@ -20,10 +20,10 @@ bytemuck = { workspace = true }
 cubecl = { workspace = true }
 cubecl-runtime = { workspace = true }
 polars-core = { workspace = true }
-polars-cubecl-buffer = { version = "0.2.0", path = "../polars-cubecl-buffer" }
-polars-cubecl-kernels = { version = "0.2.0", path = "../polars-cubecl-kernels" }
-polars-cubecl-lower = { version = "0.2.0", path = "../polars-cubecl-lower" }
-polars-cubecl-runtime = { version = "0.2.0", path = "../polars-cubecl-runtime" }
+polars-cubecl-buffer = { workspace = true }
+polars-cubecl-kernels = { workspace = true }
+polars-cubecl-lower = { workspace = true }
+polars-cubecl-runtime = { workspace = true }
 polars-error = { workspace = true }
 polars-lazy = { workspace = true }
 polars-plan = { workspace = true }
@@ -33,7 +33,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-polars-cubecl-testing = { version = "0.2.0", path = "../polars-cubecl-testing" }
+polars-cubecl-testing = { workspace = true }
 polars-io = { workspace = true, features = ["parquet"] }
 proptest = { workspace = true }
 

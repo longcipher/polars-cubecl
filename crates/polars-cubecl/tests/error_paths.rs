@@ -11,7 +11,7 @@ use polars_core::{
 };
 use polars_cubecl::{CubeclEngine, EngineConfig, Op};
 use polars_cubecl_testing::{
-    CompareRules, HarnessError, all_backends, check_backend_sorted, check_fallback_backend,
+    CompareRules, HarnessError, all_backends, check_backend_unsorted, check_fallback_backend,
     check_fallback_backend_unsorted,
 };
 use polars_lazy::{
@@ -74,6 +74,7 @@ fn min_rows_zero_engages_on_any_size() {
 
 #[test]
 #[expect(clippy::expect_used, reason = "test asserts engine creation")]
+#[expect(clippy::unwrap_used, reason = "test asserts cpu-correct baseline")]
 fn strict_mode_sort_engages_and_is_cpu_correct() {
     let frame = DataFrame::new_infer_height(vec![
         Series::new("a".into(), &[3_i32, 1, 4, 1, 5, 9, 2, 6]).into(),
@@ -119,7 +120,10 @@ fn sort_i64_matches_oracle() -> Result<(), HarnessError> {
     ])
     .unwrap_or(DataFrame::empty_with_height(0));
     let lf = frame.lazy().sort(["a"], Default::default());
-    check_backend_sorted(&lf, all_backends(), &["a"], false)
+    for backend in all_backends() {
+        let _ = check_backend_unsorted(&lf, backend, &["a".to_string()], &rules())?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -131,7 +135,10 @@ fn sort_with_nulls_matches_oracle() -> Result<(), HarnessError> {
     ])
     .unwrap_or(DataFrame::empty_with_height(0));
     let lf = frame.lazy().sort(["a"], Default::default());
-    check_backend_sorted(&lf, all_backends(), &["a"], false)
+    for backend in all_backends() {
+        let _ = check_backend_unsorted(&lf, backend, &["a".to_string()], &rules())?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

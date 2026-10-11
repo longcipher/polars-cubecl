@@ -2470,7 +2470,7 @@ mod math_fn_tests {
     }
 
     /// Lower and unwrap with a clear panic message on failure.
-    #[expect(clippy::unwrap_used)]
+    #[expect(clippy::expect_used)]
     fn lower_ok(
         arena: &mut Arena<AExpr>,
         function: IRFunctionExpr,
@@ -2605,7 +2605,7 @@ mod math_fn_tests {
         let arena = Arena::new();
         let mut builder = Builder::new(&arena);
         builder.schema = vec![(name("f"), DataType::Float64)];
-        #[expect(clippy::unwrap_used)]
+        #[expect(clippy::expect_used)]
         let dtype = builder.expr_dtype(&expr).expect("expr_dtype should succeed");
         assert_eq!(dtype, DataType::Float64);
     }
@@ -2616,7 +2616,7 @@ mod math_fn_tests {
         let arena = Arena::new();
         let mut builder = Builder::new(&arena);
         builder.schema = vec![(name("i"), DataType::Int32)];
-        #[expect(clippy::unwrap_used)]
+        #[expect(clippy::expect_used)]
         let dtype = builder.expr_dtype(&expr).expect("expr_dtype should succeed");
         assert_eq!(dtype, DataType::Int32);
     }

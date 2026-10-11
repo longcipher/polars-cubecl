@@ -16,16 +16,22 @@ criterion = "0.8.2"
 cubecl = { version = "=0.11.0", default-features = false }
 cubecl-runtime = { version = "=0.11.0", default-features = false }
 eyre = "0.6.14"
-polars-arrow = "=0.55.1"
-polars-buffer = "=0.55.1"
-polars-config = "=0.55.1"
-polars-core = { version = "=0.55.1", features = ["dtype-decimal"] }
-polars-error = "=0.55.1"
-polars-io = "=0.55.1"
-polars-lazy = { version = "=0.55.1", features = ["abs", "log", "round_series", "sign", "trigonometry"] }
-polars-plan = { version = "=0.55.1", features = ["abs", "log", "round_series", "sign", "trigonometry"] }
-polars-utils = "=0.55.1"
-proptest = "1.11.0"
+polars-arrow = "=0.55.2"
+polars-buffer = "=0.55.2"
+polars-config = "=0.55.2"
+polars-core = { version = "=0.55.2", features = ["dtype-decimal"] }
+polars-cubecl = { version = "0.2.0", path = "crates/polars-cubecl" }
+polars-cubecl-buffer = { version = "0.2.0", path = "crates/polars-cubecl-buffer" }
+polars-cubecl-kernels = { version = "0.2.0", path = "crates/polars-cubecl-kernels" }
+polars-cubecl-lower = { version = "0.2.0", path = "crates/polars-cubecl-lower" }
+polars-cubecl-runtime = { version = "0.2.0", path = "crates/polars-cubecl-runtime" }
+polars-cubecl-testing = { version = "0.2.0", path = "crates/polars-cubecl-testing" }
+polars-error = "=0.55.2"
+polars-io = "=0.55.2"
+polars-lazy = { version = "=0.55.2", features = ["abs", "log", "round_series", "sign", "trigonometry"] }
+polars-plan = { version = "=0.55.2", features = ["abs", "log", "round_series", "sign", "trigonometry"] }
+polars-utils = "=0.55.2"
+proptest = "1.12.0"
 rustc-hash = "2"
 thiserror = "2.0.21"
 

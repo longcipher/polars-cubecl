@@ -73,10 +73,22 @@ fn join_of_filtered_scans_accelerates_both_arms() -> Result<(), HarnessError> {
 }
 
 #[test]
+#[expect(clippy::expect_used, reason = "test asserts concat build")]
 fn fully_unsupported_plan_still_falls_back() -> Result<(), HarnessError> {
+    use polars_lazy::dsl::concat;
     for backend in all_backends() {
-        // Sort of a bare scan: no supported head anywhere.
-        let lf: LazyFrame = int_frame().lazy().sort(["a"], Default::default());
+        // `concat` is outside the engine's supported subset (no Filter, Project,
+        // Slice, GroupBy, or Sort kernel at the head). It must fall back cleanly.
+        let other = DataFrame::new_infer_height(vec![
+            Series::new("a".into(), &[7_i32, 8]).into(),
+            Series::new("v".into(), &[Some(70_i64), Some(80)]).into(),
+        ])
+        .unwrap_or(DataFrame::empty_with_height(0));
+        let lf = concat(
+            [int_frame().lazy(), other.lazy()],
+            polars_lazy::prelude::UnionArgs::default(),
+        )
+        .expect("concat build failed");
         let _ = check_fallback_backend(&lf, backend, &rules())?;
     }
     Ok(())
