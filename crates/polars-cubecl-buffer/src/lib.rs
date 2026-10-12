@@ -108,6 +108,16 @@ impl DType {
             Self::Bool => DataType::Boolean,
         }
     }
+
+    /// Size of one element in bytes.
+    #[must_use]
+    pub const fn size(self) -> usize {
+        match self {
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::I64 | Self::U64 | Self::F64 => 8,
+            Self::Bool => 1,
+        }
+    }
 }
 
 /// Dense host-side values for one column. Boolean values are `u8`.
@@ -157,11 +167,25 @@ impl HostValues {
         }
     }
 
-    /// Whether the column has no rows.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+/// Whether the column has no rows.
+#[must_use]
+pub fn is_empty(&self) -> bool {
+    self.len() == 0
+}
+
+/// View the values as a `&[u8]` of their packed little-endian representation.
+#[must_use]
+pub fn to_bytes(&self) -> Vec<u8> {
+    match self {
+        Self::I32(v) => bytemuck::cast_slice(v).to_vec(),
+        Self::I64(v) => bytemuck::cast_slice(v).to_vec(),
+        Self::U32(v) => bytemuck::cast_slice(v).to_vec(),
+        Self::U64(v) => bytemuck::cast_slice(v).to_vec(),
+        Self::F32(v) => bytemuck::cast_slice(v).to_vec(),
+        Self::F64(v) => bytemuck::cast_slice(v).to_vec(),
+        Self::Bool(v) => v.clone(),
     }
+}
 }
 
 /// One column in canonical host form: dense values plus a `u8` validity mask.
@@ -344,7 +368,8 @@ pub fn upload_frame(client: &Client, frame: &DataFrame) -> Result<Vec<DeviceColu
 /// Empty columns skip the readback: their handles may be padding (see
 /// [`upload`]), and there is nothing to read.
 pub fn download(client: &Client, column: &DeviceColumn) -> Result<HostColumn, BufferError> {
-    if column.is_empty() {
+    let len = column.len();
+    if len == 0 {
         return Ok(HostColumn {
             name: column.name.clone(),
             dtype: column.dtype,
@@ -358,21 +383,74 @@ pub fn download(client: &Client, column: &DeviceColumn) -> Result<HostColumn, Bu
     let validity_bytes = client
         .read_one(column.validity.clone())
         .map_err(|error| BufferError::Readback(error.to_string()))?;
+    // Buffer pooling may return a handle larger than `len * type_size`. The
+    // kernel only writes `len` elements, so truncate any trailing padding
+    // to avoid reading stale data from a recycled allocation.
+    let type_size = column.dtype.size();
+    let value_len = len.saturating_mul(type_size);
     let values = match column.dtype {
-        DType::I32 => HostValues::I32(i32::from_bytes(&value_bytes).to_vec()),
-        DType::I64 => HostValues::I64(i64::from_bytes(&value_bytes).to_vec()),
-        DType::U32 => HostValues::U32(u32::from_bytes(&value_bytes).to_vec()),
-        DType::U64 => HostValues::U64(u64::from_bytes(&value_bytes).to_vec()),
-        DType::F32 => HostValues::F32(f32::from_bytes(&value_bytes).to_vec()),
-        DType::F64 => HostValues::F64(f64::from_bytes(&value_bytes).to_vec()),
-        DType::Bool => HostValues::Bool(value_bytes.to_vec()),
+        DType::I32 => {
+            let bytes = &value_bytes[..value_len.min(value_bytes.len())];
+            HostValues::I32(i32::from_bytes(bytes).to_vec())
+        }
+        DType::I64 => {
+            let bytes = &value_bytes[..value_len.min(value_bytes.len())];
+            HostValues::I64(i64::from_bytes(bytes).to_vec())
+        }
+        DType::U32 => {
+            let bytes = &value_bytes[..value_len.min(value_bytes.len())];
+            HostValues::U32(u32::from_bytes(bytes).to_vec())
+        }
+        DType::U64 => {
+            let bytes = &value_bytes[..value_len.min(value_bytes.len())];
+            HostValues::U64(u64::from_bytes(bytes).to_vec())
+        }
+        DType::F32 => {
+            let bytes = &value_bytes[..value_len.min(value_bytes.len())];
+            HostValues::F32(f32::from_bytes(bytes).to_vec())
+        }
+        DType::F64 => {
+            let bytes = &value_bytes[..value_len.min(value_bytes.len())];
+            HostValues::F64(f64::from_bytes(bytes).to_vec())
+        }
+        DType::Bool => {
+            let bytes = &value_bytes[..value_len.min(value_bytes.len())];
+            HostValues::Bool(bytes.to_vec())
+        }
     };
+    let validity = validity_bytes[..len.min(validity_bytes.len())].to_vec();
     Ok(HostColumn {
         name: column.name.clone(),
         dtype: column.dtype,
         values,
-        validity: validity_bytes.to_vec(),
+        validity,
     })
+}
+
+/// Download multiple device columns to host in a single batched readback.
+///
+/// Batches all value + validity handle reads into one [`Client::read`] call,
+/// collapsing `2 × columns` sequential syncs into a single round-trip.
+pub fn download_columns(
+    client: &Client,
+    columns: &[DeviceColumn],
+) -> Result<Vec<HostColumn>, BufferError> {
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut handles = Vec::with_capacity(columns.len() * 2);
+    for column in columns {
+        handles.push(column.values.clone());
+        handles.push(column.validity.clone());
+    }
+    let batch = client
+        .read(handles)
+        .map_err(|error| BufferError::Readback(error.to_string()))?;
+    let mut out = Vec::with_capacity(columns.len());
+    for (column, chunks) in columns.iter().zip(batch.chunks_exact(2)) {
+        out.push(build_host_column(column, &chunks[0], &chunks[1])?);
+    }
+    Ok(out)
 }
 
 /// Rebuild a [`Series`] from canonical host form.
@@ -410,13 +488,74 @@ pub fn host_to_series(column: &HostColumn) -> Result<Series, BufferError> {
 }
 
 /// Download a full set of device columns into a [`DataFrame`].
+///
+/// Batched readback: submits all value + validity handles via
+/// [`Client::read`] (a single `read_async` round-trip) instead of calling
+/// `read_one` per buffer. On CUDA this collapses `2×columns` syncs into
+/// one stream-level submit, reducing driver overhead.
 pub fn download_frame(client: &Client, columns: &[DeviceColumn]) -> Result<DataFrame, BufferError> {
     let mut output = Vec::with_capacity(columns.len());
+
+    if columns.is_empty() {
+        return DataFrame::new_infer_height(output)
+            .map_err(|error| BufferError::Rebuild(error.to_string()));
+    }
+
+    // Build one handle list: [val_0, valid_0, val_1, valid_1, ...].
+    let mut handles = Vec::with_capacity(columns.len() * 2);
     for column in columns {
-        let series = host_to_series(&download(client, column)?)?;
+        handles.push(column.values.clone());
+        handles.push(column.validity.clone());
+    }
+
+    // Single readback round-trip.
+    let batch = client
+        .read(handles)
+        .map_err(|error| BufferError::Readback(error.to_string()))?;
+
+    // Rebuild host columns interleaving value / validity chunks from the
+    // batch result.
+    for (column, chunks) in columns.iter().zip(batch.chunks_exact(2)) {
+        let value_bytes = &chunks[0];
+        let validity_bytes = &chunks[1];
+        let host = build_host_column(column, value_bytes, validity_bytes)?;
+        let series = host_to_series(&host)?;
         output.push(Column::from(series));
     }
+
     DataFrame::new_infer_height(output).map_err(|error| BufferError::Rebuild(error.to_string()))
+}
+
+/// Build a [`HostColumn`] from raw value + validity bytes, mirroring the
+/// per-field dispatch in [`download`] but without re-reading the device.
+fn build_host_column(
+    column: &DeviceColumn,
+    value_bytes: &[u8],
+    validity_bytes: &[u8],
+) -> Result<HostColumn, BufferError> {
+    let (name, dtype, len) = (column.name.clone(), column.dtype, column.len());
+    if len == 0 {
+        return Ok(HostColumn {
+            name,
+            dtype,
+            values: empty_values(dtype, 0),
+            validity: Vec::new(),
+        });
+    }
+    // Truncate to `len` elements in case the pooled handle is larger.
+    let type_size = dtype.size();
+    let value_len = len.saturating_mul(type_size);
+    let values = match dtype {
+        DType::I32 => HostValues::I32(i32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
+        DType::I64 => HostValues::I64(i64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
+        DType::U32 => HostValues::U32(u32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
+        DType::U64 => HostValues::U64(u64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
+        DType::F32 => HostValues::F32(f32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
+        DType::F64 => HostValues::F64(f64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
+        DType::Bool => HostValues::Bool(value_bytes[..value_len.min(value_bytes.len())].to_vec()),
+    };
+    let validity = validity_bytes[..len.min(validity_bytes.len())].to_vec();
+    Ok(HostColumn { name, dtype, values, validity })
 }
 
 fn empty_values(dtype: DType, capacity: usize) -> HostValues {

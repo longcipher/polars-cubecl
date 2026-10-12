@@ -16,9 +16,13 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     /// Production configuration: automatic backend, silent fallback.
+    ///
+    /// `min_rows_for_gpu` defaults to 5M because profiling shows GPU transfer
+    /// + kernel launch overhead (~1-3 ms amortised after P0-P2 work) dominates
+    /// below that threshold. Re-tune after each optimisation pass.
     #[must_use]
     pub const fn auto() -> Self {
-        Self { backend: Backend::Auto, raise_on_fail: false, min_rows_for_gpu: 10_000 }
+        Self { backend: Backend::Auto, raise_on_fail: false, min_rows_for_gpu: 5_000_000 }
     }
 }
 

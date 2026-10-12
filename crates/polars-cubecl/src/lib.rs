@@ -6,6 +6,7 @@
 //! CPU/streaming engine: the engine can only make a query slower, never
 //! wrong.
 
+mod buffer_pool;
 mod config;
 mod engine;
 mod error;

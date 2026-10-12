@@ -27,9 +27,15 @@ pub struct CubeclEngine {
 }
 
 impl CubeclEngine {
-    /// Create an engine, selecting the configured backend.
+    /// Create an engine, selecting the configured backend, and warm up every
+    /// kernel path so the first user query does not pay JIT/initialisation
+    /// costs. Warm-up failures are logged but never fatal: the engine is
+    /// functional even if a warm-up kernel could not launch.
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
         let runtime = RuntimeContext::select(config.backend)?;
+        if let Err(error) = polars_cubecl_kernels::warm_up(runtime.client()) {
+            eprintln!("[polars-cubecl] kernel warm-up skipped: {error}");
+        }
         Ok(Self { config, runtime })
     }
 

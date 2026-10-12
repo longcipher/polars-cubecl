@@ -13,12 +13,14 @@
 
 use cubecl::prelude::Client;
 use cubecl_runtime::server::Handle;
-use polars_cubecl_buffer::{DType, DeviceColumn, HostColumn, HostValues, download};
+use polars_cubecl_buffer::{
+    DType, DeviceColumn, HostColumn, HostValues, download, download_columns,
+};
 use polars_cubecl_lower::Aggregation;
 use polars_utils::pl_str::PlSmallStr;
 use rustc_hash::FxHashMap;
 
-use crate::exec::{ExecError, alloc, create_slice, dtype_size, find_column};
+use crate::exec::{ExecError, alloc, create_slice, dtype_size, find_column, recycle_handle};
 
 /// A normalized group-key component: `None` is a null key part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,8 +93,14 @@ const fn normalize_f64(value: f64) -> u64 {
 
 /// Grouping of `height` rows: dense first-seen ids, per-group sizes, and the
 /// row-order first/last row of every group.
+///
+/// When `gpu_assignment` is `Some`, the caller skips the host-side
+/// download and re-upload of the assignment vector. `assignment` must be
+/// empty in that case.
 struct Grouping {
+    height: usize,
     assignment: Vec<u32>,
+    gpu_assignment: Option<Handle>,
     sizes: Vec<u32>,
     first_rows: Vec<u32>,
     last_rows: Vec<u32>,
@@ -101,9 +109,113 @@ struct Grouping {
 fn group_rows(key_columns: &[HostColumn]) -> Grouping {
     let height = key_columns.first().map_or(0, HostColumn::len);
     if key_columns.len() == 1 {
-        group_single(&key_columns[0], height)
+        let col = &key_columns[0];
+        let validity = col.validity();
+        // Fast path: dense-range integer keys with no nulls → direct array
+        // indexing. Avoids the FxHashMap of the general path, which is the
+        // dominant CPU cost of group-by for small-range keys.
+        if height > 0 && validity.iter().take(height).all(|&v| v != 0) {
+            match col.dtype() {
+                DType::I32 => {
+                    let HostValues::I32(values) = col.values() else { unreachable!() };
+                    let (min, max) = values.iter().take(height).fold(
+                        (i32::MAX, i32::MIN),
+                        |(min, max), &v| (min.min(v), max.max(v)),
+                    );
+                    let range = (max as i64 - min as i64 + 1).max(0) as usize;
+                    if range > 0 && range <= 65536 {
+                        return group_single_dense_i32(values, height, min, range);
+                    }
+                }
+                DType::I64 => {
+                    let HostValues::I64(i64_values) = col.values() else { unreachable!() };
+                    let (min, max) = i64_values.iter().take(height).fold(
+                        (i64::MAX, i64::MIN),
+                        |(min, max), &v| (min.min(v), max.max(v)),
+                    );
+                    let range = (max - min + 1).max(0) as usize;
+                    if range > 0 && range <= 65536 {
+                        return group_single_dense_i64(i64_values, height, min, range);
+                    }
+                }
+                _ => {}
+            }
+        }
+        group_single(col, height)
     } else {
         group_multi(key_columns, height)
+    }
+}
+
+/// Dense direct-indexing grouping for non-null `i32` keys whose value range
+/// fits in a small array. Avoids the `FxHashMap` of the general path.
+fn group_single_dense_i32(values: &[i32], height: usize, min: i32, range: usize) -> Grouping {
+    // Map raw key → dense group id via direct indexing.
+    let mut dense_id: Vec<Option<u32>> = vec![None; range];
+    let mut assignment = Vec::with_capacity(height);
+    let mut sizes = Vec::new();
+    let mut first_rows = Vec::new();
+    let mut last_rows = Vec::new();
+    let min = min as i64;
+    for row in 0..height {
+        let bucket = (values[row] as i64 - min) as usize;
+        let next = sizes.len() as u32;
+        let id = match &mut dense_id[bucket] {
+            Some(id) => *id,
+            slot => {
+                *slot = Some(next);
+                sizes.push(0);
+                first_rows.push(row as u32);
+                last_rows.push(row as u32);
+                next
+            }
+        };
+        sizes[id as usize] += 1;
+        last_rows[id as usize] = row as u32;
+        assignment.push(id);
+    }
+        Grouping {
+            height,
+            assignment,
+            gpu_assignment: None,
+            sizes,
+            first_rows,
+            last_rows,
+        }
+}
+
+/// Dense direct-indexing grouping for non-null `i64` keys; same approach as
+/// `group_single_dense_i32` but with `i64` keys.
+fn group_single_dense_i64(values: &[i64], height: usize, min: i64, range: usize) -> Grouping {
+    let mut dense_id: Vec<Option<u32>> = vec![None; range];
+    let mut assignment = Vec::with_capacity(height);
+    let mut sizes = Vec::new();
+    let mut first_rows = Vec::new();
+    let mut last_rows = Vec::new();
+    for row in 0..height {
+        let bucket = (values[row] - min) as usize;
+        let next = sizes.len() as u32;
+        let id = match &mut dense_id[bucket] {
+            Some(id) => *id,
+            slot => {
+                *slot = Some(next);
+                sizes.push(0);
+                first_rows.push(row as u32);
+                last_rows.push(row as u32);
+                next
+            }
+        };
+        sizes[id as usize] += 1;
+        last_rows[id as usize] = row as u32;
+        assignment.push(id);
+    }
+    Grouping {
+        height,
+        assignment,
+        gpu_assignment: None,
+        sizes,
+        first_rows,
+        last_rows,
     }
 }
 
@@ -126,7 +238,14 @@ fn group_single(column: &HostColumn, height: usize) -> Grouping {
         last_rows[id as usize] = row as u32;
         assignment.push(id);
     }
-    Grouping { assignment, sizes, first_rows, last_rows }
+    Grouping {
+        height,
+        assignment,
+        gpu_assignment: None,
+        sizes,
+        first_rows,
+        last_rows,
+    }
 }
 
 fn group_multi(key_columns: &[HostColumn], height: usize) -> Grouping {
@@ -152,7 +271,159 @@ fn group_multi(key_columns: &[HostColumn], height: usize) -> Grouping {
         last_rows[id as usize] = row as u32;
         assignment.push(id);
     }
-    Grouping { assignment, sizes, first_rows, last_rows }
+    Grouping {
+        height,
+        assignment,
+        gpu_assignment: None,
+        sizes,
+        first_rows,
+        last_rows,
+    }
+}
+
+/// Maximum key range for which the GPU histogram path is used. Beyond this,
+/// the per-bucket `Vec<Atomic<u32>>` is too large to alloc + download.
+const GPU_HISTOGRAM_MAX_BUCKETS: usize = 65536;
+
+/// Try to group small-range `i32` keys without downloading the key column.
+///
+/// Returns `Ok(None)` if the key has nulls or the range is too wide (fall back
+/// to the host path). Returns `Ok(Some(grouping))` on success.
+///
+/// Pipeline (all on GPU until step 5):
+/// 1. Download key validity, check for nulls (tiny readback).
+/// 2. `launch_reduce_min::<i32>` with one group → global min.
+/// 3. `launch_reduce_max::<i32>` with one group → global max.
+/// 4. Read back min+max (8 bytes, one sync).
+/// 5. Launch GPU histogram; read back counts (`num_buckets * 4` bytes).
+/// 6. Build Grouping from counts + a GPU kernel that computes per-row
+///    `assignment[row] = (keys[row] - min_val) as u32` on the device.
+fn try_gpu_histogram_grouping(
+    client: &Client,
+    key_col: &DeviceColumn,
+    height: usize,
+) -> Result<Option<Grouping>, ExecError> {
+    // 1. Check nulls in the validity mask.
+    let valid_bytes = client
+        .read_one(key_col.validity().clone())
+        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    if valid_bytes.iter().take(height).any(|&b| b == 0) {
+        return Ok(None); // nulls: fall back to host path
+    }
+
+    // 2–3. Global min + max in one group:
+    //    seg_off=[0], seg_len=[height], all rows → group 0.
+    let seg_off_handle: Handle = client.create_from_slice(bytemuck::cast_slice(&[0_u32]));
+    let seg_len_handle: Handle =
+        client.create_from_slice(bytemuck::cast_slice(&[height as u32]));
+    let slots_handle: Handle = alloc(client, height.saturating_mul(4));
+
+    let min_val_handle = alloc(client, 4);
+    let min_valid_handle = alloc(client, 1);
+    let min_params = polars_cubecl_kernels::ReduceParams {
+        slots: &slots_handle,
+        seg_off: &seg_off_handle,
+        seg_len: &seg_len_handle,
+        num_groups: 1,
+        out_values: &min_val_handle,
+        out_valid: &min_valid_handle,
+    };
+    polars_cubecl_kernels::launch_reduce_min::<i32>(
+        client,
+        key_col.values(),
+        key_col.validity(),
+        height,
+        min_params,
+    )?;
+
+    let max_val_handle = alloc(client, 4);
+    let max_valid_handle = alloc(client, 1);
+    let max_params = polars_cubecl_kernels::ReduceParams {
+        slots: &slots_handle,
+        seg_off: &seg_off_handle,
+        seg_len: &seg_len_handle,
+        num_groups: 1,
+        out_values: &max_val_handle,
+        out_valid: &max_valid_handle,
+    };
+    polars_cubecl_kernels::launch_reduce_max::<i32>(
+        client,
+        key_col.values(),
+        key_col.validity(),
+        height,
+        max_params,
+    )?;
+
+    // 4. Read back min + max (8 bytes total).
+    let min_bytes = client
+        .read_one(min_val_handle)
+        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    let max_bytes = client
+        .read_one(max_val_handle)
+        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    let min_val = bytemuck::cast_slice::<u8, i32>(&min_bytes[..4])[0];
+    let max_val = bytemuck::cast_slice::<u8, i32>(&max_bytes[..4])[0];
+
+    let range = (max_val as i64 - min_val as i64 + 1).max(0) as usize;
+    if range == 0 || range > GPU_HISTOGRAM_MAX_BUCKETS {
+        return Ok(None);
+    }
+
+    // 5. GPU histogram.
+    let num_buckets = range;
+    let min_scalar: Handle = client.create_from_slice(bytemuck::cast_slice(&[min_val]));
+    let histo_counts = alloc(client, num_buckets.saturating_mul(4));
+    polars_cubecl_kernels::launch_gpu_histogram(
+        client,
+        key_col.values(),
+        &min_scalar,
+        &histo_counts,
+        height,
+        num_buckets,
+    )?;
+    let counts_bytes = client
+        .read_one(histo_counts)
+        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    let counts: &[u32] = bytemuck::cast_slice(&counts_bytes);
+    let counts: Vec<u32> = counts.iter().take(num_buckets).copied().collect();
+
+    // 6. Build Grouping sizes and per-row assignment entirely on the GPU.
+    //    sizes = counts (filtering empty buckets).
+    //    assignment = GPU kernel computes `keys[row] - min` → dense group id.
+    let sizes: Vec<u32> = counts.iter().copied().filter(|&c| c > 0).collect();
+    let num_groups = sizes.len();
+    let mut first_rows = Vec::with_capacity(num_groups);
+    let mut last_rows = Vec::with_capacity(num_groups);
+    let mut edge = 0_u32;
+    for &count in &sizes {
+        first_rows.push(edge);
+        last_rows.push(edge + count - 1);
+        edge = edge.saturating_add(count);
+    }
+
+    // GPU: compute `assignment[row] = (keys[row] - min) as u32`.
+    // The result stays on the GPU — finish_grouping reads the handle
+    // directly, avoiding a 4 * height byte host round-trip.
+    let assignment_handle = alloc(client, height.saturating_mul(4));
+    polars_cubecl_kernels::launch_keys_to_group_i32(
+        client,
+        key_col.values(),
+        &min_scalar,
+        &assignment_handle,
+        height,
+    )?;
+
+    // Recycle scratch handles.
+    recycle_handle(min_scalar, 4);
+
+    Ok(Some(Grouping {
+        height,
+        assignment: Vec::new(),
+        gpu_assignment: Some(assignment_handle),
+        sizes,
+        first_rows,
+        last_rows,
+    }))
 }
 
 /// Apply one `GroupBy` pipeline step.
@@ -170,15 +441,51 @@ pub fn apply(
     aggs: &[Aggregation],
 ) -> Result<Vec<DeviceColumn>, ExecError> {
     let height = columns.first().map_or(0, DeviceColumn::len);
-    let mut key_hosts = Vec::with_capacity(keys.len());
-    for (_, input) in keys {
-        let index = find_column(&columns, input)?;
-        key_hosts.push(download(client, &columns[index])?);
-    }
-    let grouping = group_rows(&key_hosts);
-    let num_groups = grouping.sizes.len();
+    let key_device_cols: Vec<DeviceColumn> = keys
+        .iter()
+        .map(|(_, input)| -> Result<DeviceColumn, ExecError> {
+            Ok(columns[find_column(&columns, input)?].clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let assignment = create_slice(client, bytemuck::cast_slice(&grouping.assignment));
+    // GPU histogram fast path: for single-column i32 keys with small range,
+    // avoid downloading the key column entirely. Compute min/max + histogram
+    // on the GPU; only counts (num_buckets * 4 bytes) round-trip to the host.
+    if keys.len() == 1 {
+        let key_col = &key_device_cols[0];
+        if key_col.dtype() == DType::I32 && height > 0 {
+            if let Some(grouping) =
+                try_gpu_histogram_grouping(client, key_col, height)?
+            {
+                return finish_grouping(client, f64_ok, columns, keys, aggs, grouping);
+            }
+        }
+    }
+
+    // Fallback: batch-download all key columns to host for grouping.
+    let key_hosts = download_columns(client, &key_device_cols)?;
+    let grouping = group_rows(&key_hosts);
+    finish_grouping(client, f64_ok, columns, keys, aggs, grouping)
+}
+
+/// Shared tail path: given a `Grouping`, perform the invert + reductions.
+fn finish_grouping(
+    client: &Client,
+    f64_ok: bool,
+    columns: Vec<DeviceColumn>,
+    keys: &[(PlSmallStr, PlSmallStr)],
+    aggs: &[Aggregation],
+    grouping: Grouping,
+) -> Result<Vec<DeviceColumn>, ExecError> {
+    let num_groups = grouping.sizes.len();
+    let height = grouping.height;
+
+    // Use the GPU-resident assignment handle directly when available; otherwise
+    // upload the host-side Vec<u32> to the device.
+    let assignment = match grouping.gpu_assignment {
+        Some(ref handle) => handle.clone(),
+        None => create_slice(client, bytemuck::cast_slice(&grouping.assignment)),
+    };
     let mut seg_off = Vec::with_capacity(num_groups);
     let mut edge = 0_u32;
     for size in &grouping.sizes {

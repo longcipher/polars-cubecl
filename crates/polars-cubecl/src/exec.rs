@@ -12,7 +12,8 @@
 use cubecl::prelude::Client;
 use polars_core::frame::DataFrame;
 use polars_cubecl_buffer::{
-    BufferError, DType, DeviceColumn, download, download_frame, series_to_host, upload,
+    BufferError, DType, DeviceColumn, HostValues, download, download_columns, download_frame,
+    series_to_host, upload,
 };
 use polars_cubecl_kernels::{
     BinOp as KernelBinOp, CmpOp as KernelCmpOp, KernelError, UnaryOp as KernelUnaryOp,
@@ -25,6 +26,7 @@ use polars_cubecl_runtime::{RuntimeContext, supports_f64};
 use polars_utils::pl_str::PlSmallStr;
 use thiserror::Error;
 
+use crate::buffer_pool;
 use crate::groupby;
 
 /// Error returned when a lowered plan cannot be executed.
@@ -60,7 +62,7 @@ pub fn execute_plan(
 ) -> Result<(DataFrame, Vec<crate::Op>), ExecError> {
     let client = ctx.client();
     let f64_ok = supports_f64(ctx.kind());
-    let mut columns = ingest(client, plan.source())?;
+    let mut columns = ingest(client, plan.source(), plan)?;
     let mut ops = Vec::with_capacity(plan.ops().len());
     for op in plan.ops() {
         match op {
@@ -87,15 +89,46 @@ pub fn execute_plan(
         }
     }
     let frame = download_frame(client, &columns)?;
+    // Recycle device buffers into the pool for reuse by subsequent plans.
+    // After download, columns are no longer needed; their handles go back to
+    // the thread-local pool so the next call's alloc() avoids cudaMalloc.
+    recycle_device_columns(&columns);
     Ok((frame, ops))
 }
 
-fn ingest(client: &Client, source: &PlanSource) -> Result<Vec<DeviceColumn>, ExecError> {
+/// Recycle every buffer backing a plan's device columns. Called after the
+/// result has been downloaded; the columns are about to be dropped, so
+/// pooling their handles turns a `cudaMalloc`+`cudaFree` pair per op into
+/// `acquire`+`recycle` of an existing buffer.
+fn recycle_device_columns(columns: &[DeviceColumn]) {
+    for col in columns {
+        let value_bytes = col.len().saturating_mul(dtype_size(col.dtype()));
+        if value_bytes > 0 {
+            recycle_handle(col.values().clone(), value_bytes);
+        }
+        if col.len() > 0 {
+            recycle_handle(col.validity().clone(), col.len());
+        }
+    }
+}
+
+fn ingest(
+    client: &Client,
+    source: &PlanSource,
+    plan: &CubePlan,
+) -> Result<Vec<DeviceColumn>, ExecError> {
+    let needed = plan.needed_source_columns();
+    if needed.is_empty() {
+        // No source columns survive to any op — this can happen for a pure
+        // zero-column plan (unreachable in practice because lowering rejects
+        // it, but be defensive).
+        return Ok(Vec::new());
+    }
     match source {
-        PlanSource::DataFrame { frame, columns } => ingest_frame(client, frame, columns),
-        PlanSource::Parquet { path, columns, .. } => {
+        PlanSource::DataFrame { frame, .. } => ingest_frame(client, frame, &needed),
+        PlanSource::Parquet { path, .. } => {
             let frame = read_parquet_file(path)?;
-            ingest_frame(client, &frame, columns)
+            ingest_frame(client, &frame, &needed)
         }
     }
 }
@@ -150,11 +183,32 @@ fn height_of(columns: &[DeviceColumn]) -> usize {
 /// buffers get a one-byte stand-in. Lengths are always tracked separately
 /// in [`DeviceColumn`], and kernels never touch rows beyond the real length,
 /// so the padding is never read or written.
+///
+/// Pooled: returns a buffer from the thread-local pool when one of matching
+/// size is available, avoiding the ~10-100 µs CUDA `cudaMalloc` cost on hot
+/// paths. Recycle via [`recycle_handle`] when the buffer is no longer needed.
 pub(crate) fn alloc(client: &Client, bytes: usize) -> cubecl_runtime::server::Handle {
-    client.empty(bytes.max(1))
+    buffer_pool::acquire(client, bytes)
 }
 
-/// Upload bytes, padding empties: some backends refuse zero-byte buffers.
+/// Return a kernel output buffer to the pool for reuse by a future call to
+/// [`alloc`]. Skip on zero-byte (padded) buffers: re-pooling them saves
+/// nothing because they'll just round up to the same 64-byte bucket.
+pub(crate) fn recycle_handle(handle: cubecl_runtime::server::Handle, bytes: usize) {
+    if bytes > 0 {
+        buffer_pool::recycle(handle, bytes);
+    }
+}
+
+pub(crate) const fn dtype_size(dtype: DType) -> usize {
+    match dtype {
+        DType::I32 | DType::U32 | DType::F32 => 4,
+        DType::I64 | DType::U64 | DType::F64 => 8,
+        DType::Bool => 1,
+    }
+}
+
+/// Elementwise comparison of `values` against a single literal.
 /// Lengths are tracked separately everywhere, so the padding is inert.
 pub(crate) fn create_slice(client: &Client, bytes: &[u8]) -> cubecl_runtime::server::Handle {
     client.create_from_slice(if bytes.is_empty() { &[0] } else { bytes })
@@ -245,6 +299,10 @@ fn scalar_to_bytes(lit: ScalarLit) -> Vec<u8> {
 }
 
 /// Evaluate a binary operation on two (recursively evaluated) sub-expressions.
+///
+/// Both sides are evaluated in full; the result is compared or combined
+/// elementwise. Literal fast-paths are not yet implemented — when they are,
+/// they should avoid materialising a full-height literal column.
 fn eval_binop(
     client: &Client,
     f64_ok: bool,
@@ -773,8 +831,7 @@ fn apply_filter(
     let (indices, kept) = compact_indices(client, &mask, height)?;
     let mut output = Vec::with_capacity(columns.len());
     for column in &columns {
-        let values = gather_column(client, column, &indices, kept)?;
-        let validity = gather_mask(client, column.validity(), column.len(), &indices, kept)?;
+        let (values, validity) = gather_values_mask(client, column, &indices, kept)?;
         output.push(DeviceColumn::from_handles(
             column.name().clone(),
             column.dtype(),
@@ -789,9 +846,13 @@ fn apply_filter(
 /// Sort all columns by a single key column.
 ///
 /// The engine downloads the key column, computes the sort permutation on the
-/// host, then scatters a gathered index to the device and reorders every
-/// column through the existing gather infrastructure. A trailing `(offset,
-/// len)` window is applied after sorting.
+/// host, then uploads the index vector and reorders every column through the
+/// fused gather infrastructure (values + validity in one launch per column).
+/// A trailing `(offset, len)` window is applied after sorting.
+///
+/// Uses GPU radix sort for large u32/u64/i32/i64 key columns; falls back to
+/// host sorting for other types or small inputs where the DMA round-trips
+/// are cheaper than extra kernel launches.
 fn apply_sort(
     client: &Client,
     columns: Vec<DeviceColumn>,
@@ -804,12 +865,66 @@ fn apply_sort(
     if height == 0 {
         return Ok(columns);
     }
+
+    // Fast path for small row counts: download everything and sort on the
+    // host. Avoids N-column × kernel launch overhead, which dominates for
+    // tiny frames (e.g. group_by output with thousands of groups).
+    const SORT_HOST_MAX: usize = 1024;
+    if height <= SORT_HOST_MAX {
+        return apply_sort_host(client, columns, by, descending, nulls_last, slice);
+    }
+
     let key = columns
         .iter()
         .find(|column| column.name() == by)
         .ok_or_else(|| ExecError::Inconsistent(format!("sort key {by:?} missing from columns")))?;
-    let key_host = download(client, key)?;
-    // u32 permutation vector — the device gather kernel takes u32 indices.
+
+    // GPU radix sort is currently disabled. The device-side prefix-sum kernel
+    // (`radix_offsets_kernel`) runs single-threaded and is orders of magnitude
+    // slower than a CPU prefix sum for typical block counts (~1K-10K). To make
+    // the GPU path win, it needs a multi-threaded parallel prefix-sum kernel
+    // (work-efficient Blelloch scan) — tracked in Opt 3. Until then, all
+    // downloads go through the host-cooperative path below.
+    let indices = if false && matches!(key.dtype(), DType::U32 | DType::U64 | DType::I32 | DType::I64)
+        && height >= _GPU_SORT_THRESHOLD
+    {
+        gpu_radix_sort_key_indices(client, key, descending, nulls_last)?
+    } else {
+        // Host-cooperative path: download key, sort permutation on CPU,
+        // upload indices to device.
+        let key_host = download(client, key)?;
+        let mut permutation: Vec<u32> = (0..height).map(|i| i as u32).collect();
+        sort_permutation(
+            key_host.values(),
+            key_host.validity(),
+            descending,
+            nulls_last,
+            &mut permutation,
+        );
+        client.create_from_slice(bytemuck::cast_slice(&permutation))
+    };
+
+    // Reorder every column using the fused gather kernel (values + validity).
+    apply_sort_gather(client, columns, &indices, height, slice)
+}
+
+/// Sort small frames entirely on the host: download the key column, compute
+/// the permutation, then reindex every column on the host too. One sync.
+fn apply_sort_host(
+    client: &Client,
+    columns: Vec<DeviceColumn>,
+    by: &PlSmallStr,
+    descending: bool,
+    nulls_last: bool,
+    slice: Option<(i64, usize)>,
+) -> Result<Vec<DeviceColumn>, ExecError> {
+    // Batch-download all columns in one read-back round-trip.
+    let hosts = download_columns(client, &columns)?;
+    let key_host = hosts
+        .iter()
+        .find(|column| column.name() == by)
+        .ok_or_else(|| ExecError::Inconsistent(format!("sort key {by:?} missing")))?;
+    let height = key_host.len();
     let mut permutation: Vec<u32> = (0..height).map(|i| i as u32).collect();
     sort_permutation(
         key_host.values(),
@@ -818,11 +933,65 @@ fn apply_sort(
         nulls_last,
         &mut permutation,
     );
-    let indices = client.create_from_slice(bytemuck::cast_slice(&permutation));
+
+    // Apply the slice window to the permutation.
+    let permutation = if let Some((offset, len)) = slice {
+        let start = if offset >= 0 {
+            (offset as usize).min(height)
+        } else {
+            height.saturating_sub(offset.unsigned_abs() as usize)
+        };
+        let end = start.saturating_add(len).min(height);
+        permutation[start..end].to_vec()
+    } else {
+        permutation
+    };
+    let new_height = permutation.len();
+
+    // Reindex each column on the host; re-upload all.
+    let mut output = Vec::with_capacity(columns.len());
+    for (host, column) in hosts.into_iter().zip(columns.iter()) {
+        let values = permute_values(host.values(), &permutation);
+        let host_validity = host.validity();
+        let validity: Vec<u8> = permutation.iter().map(|&i| host_validity[i as usize]).collect();
+        let values_handle = client.create_from_slice(bytemuck::cast_slice(&values.to_bytes()));
+        let validity_handle = client.create_from_slice(&validity[..new_height]);
+        output.push(DeviceColumn::from_handles(
+            column.name().clone(),
+            column.dtype(),
+            values_handle,
+            validity_handle,
+            new_height,
+        ));
+    }
+    Ok(output)
+}
+
+/// Permute `values` by `permutation`, returning a new `HostValues`.
+fn permute_values(values: &HostValues, permutation: &[u32]) -> HostValues {
+    match values {
+        HostValues::I32(v) => HostValues::I32(permutation.iter().map(|&i| v[i as usize]).collect()),
+        HostValues::I64(v) => HostValues::I64(permutation.iter().map(|&i| v[i as usize]).collect()),
+        HostValues::U32(v) => HostValues::U32(permutation.iter().map(|&i| v[i as usize]).collect()),
+        HostValues::U64(v) => HostValues::U64(permutation.iter().map(|&i| v[i as usize]).collect()),
+        HostValues::F32(v) => HostValues::F32(permutation.iter().map(|&i| v[i as usize]).collect()),
+        HostValues::F64(v) => HostValues::F64(permutation.iter().map(|&i| v[i as usize]).collect()),
+        HostValues::Bool(v) => HostValues::Bool(permutation.iter().map(|&i| v[i as usize]).collect()),
+    }
+}
+
+/// GPU gather: reorder every column by `indices` on the device, then
+/// optionally apply a trailing slice window.
+fn apply_sort_gather(
+    client: &Client,
+    columns: Vec<DeviceColumn>,
+    indices: &cubecl_runtime::server::Handle,
+    height: usize,
+    slice: Option<(i64, usize)>,
+) -> Result<Vec<DeviceColumn>, ExecError> {
     let mut output = Vec::with_capacity(columns.len());
     for column in &columns {
-        let values = gather_column(client, column, &indices, height)?;
-        let validity = gather_mask(client, column.validity(), column.len(), &indices, height)?;
+        let (values, validity) = gather_values_mask(client, column, indices, height)?;
         output.push(DeviceColumn::from_handles(
             column.name().clone(),
             column.dtype(),
@@ -835,6 +1004,210 @@ fn apply_sort(
         output = apply_slice(client, output, offset, len as u32)?;
     }
     Ok(output)
+}
+
+/// Below this row count, the key DMA transfer + CPU sort is faster than the
+/// many kernel launches GPU radix sort needs (8 passes × sync points). GPU
+/// radix sort wins only at very large sizes where its O(n) passes beat the
+/// CPU's O(n log n) even with the sync overhead. RTX 3090 Ti testing shows
+/// this crossover is well above 10 M rows; until the GPU path eliminates
+/// per-pass `sync`, we keep all sorts on the host-cooperative path.
+pub(crate) const _GPU_SORT_THRESHOLD: usize = 256 * 1024;
+
+/// Sort the indices `[0, height)` by the key column on the GPU using LSD
+/// radix sort. Returns a device buffer of sorted `u32` indices.
+///
+/// The key column stays on the device throughout. The only host round-trips
+/// are the tiny `num_blocks × 256`-word histograms computed per digit pass
+/// (a few hundred bytes each), never the full key column nor the full
+/// permutation vector.
+///
+/// ## Type handling
+///
+/// | Key dtype | Transform applied before sort | `descending` flip |
+/// |-----------|-------------------------------|--------------------|
+/// | `I32`     | sign-flip (`x ^ 1<<31`)       | NOT the sign-flip  |
+/// | `I64`     | sign-flip (`x ^ 1<<63`)       | NOT the sign-flip  |
+/// | `U32`     | identity (already unsigned)   | NOT the raw value  |
+/// | `U64`     | identity (already unsigned)   | NOT the raw value  |
+///
+/// For `descending`, the sign-flipped (signed) or plain (unsigned) key is
+/// additionally bitwise-NOT'd, which reverses unsigned ordering and turns the
+/// natural ascending radix-sort into a correct descending sort.
+///
+/// Nulls: the GPU scatter kernel is not mask-aware, so this routine falls
+/// back to the host-sort path when any null is present in the key column.
+fn gpu_radix_sort_key_indices(
+    client: &Client,
+    key: &DeviceColumn,
+    descending: bool,
+    nulls_last: bool,
+) -> Result<cubecl_runtime::server::Handle, ExecError> {
+    use polars_cubecl_kernels::{
+        RADIX_BINS, RADIX_PASSES_U32, RADIX_PASSES_U64, launch_fill_index,
+        launch_not_u32, launch_not_u64, launch_radix_histogram_u32, launch_radix_histogram_u64,
+        launch_radix_offsets, launch_radix_scatter_u32, launch_radix_scatter_u64,
+        launch_sign_flip_u32, launch_sign_flip_u64,
+    };
+
+    let height = key.len();
+    assert!(height > 0, "apply_sort short-circuits height == 0");
+
+    // Only integer keys (signed or unsigned, 32/64-bit) get the GPU path.
+    let (passes, elem_size) = match key.dtype() {
+        DType::I32 => (RADIX_PASSES_U32, 4usize),
+        DType::I64 => (RADIX_PASSES_U64, 8),
+        DType::U32 => (RADIX_PASSES_U32, 4),
+        DType::U64 => (RADIX_PASSES_U64, 8),
+        _ => return gpu_sort_host_fallback(client, key, descending, nulls_last),
+    };
+
+    // Columns with nulls fall back: the scatter kernel does not honour the
+    // validity mask, so a sentinel pre-pass would be required.
+    if key_validity_has_nulls(client, key, height)? {
+        return gpu_sort_host_fallback(client, key, descending, nulls_last);
+    }
+
+    // Topology: one block-thread per histogram block, each scans `grid` rows.
+    // Keep num_blocks small so the histogram download is cheap.
+    let num_blocks = height.div_ceil(1024).max(1);
+    let grid = height.div_ceil(num_blocks);
+    let passes_usize = passes as usize;
+
+    // Ping-pong buffers for LSD passes. `keys_a`/`keys_b` hold either the
+    // sign-flipped signed key (for I32/I64) or a device copy of the raw
+    // unsigned key (for U32/U64); the sign-flip/Copy and NOT kernels write
+    // to a *different* buffer than they read (no in-place support), so we
+    // use the ping-pong pair.
+    let mut keys_a = alloc(client, height * elem_size);
+    let mut keys_b = alloc(client, height * elem_size);
+    let indices = alloc(client, height * 4);
+    let indices_scratch = alloc(client, height * 4);
+    let histograms = alloc(client, num_blocks * RADIX_BINS as usize * 4);
+
+    // Step 1: prepare a sortable key buffer.
+    //   - Signed types: sign-flip → keys_a (so i32/i64 sort as unsigned).
+    //   - Unsigned types: identity. We read directly into keys_a via the
+    //     ping-pong's second buffer, then swap pointers so keys_a is the
+    //     working source.
+    // For descending: additionally NOT the prepared key right after, which
+    // reverses unsigned ordering within the same buffer pair.
+    match key.dtype() {
+        DType::I32 => {
+            launch_sign_flip_u32(client, key.values(), height, &keys_a)?;
+            if descending {
+                launch_not_u32(client, &keys_a, height, &keys_b)?;
+                std::mem::swap(&mut keys_a, &mut keys_b);
+            }
+        }
+        DType::I64 => {
+            launch_sign_flip_u64(client, key.values(), height, &keys_a)?;
+            if descending {
+                launch_not_u64(client, &keys_a, height, &keys_b)?;
+                std::mem::swap(&mut keys_a, &mut keys_b);
+            }
+        }
+        DType::U32 => {
+            // Raw unsigned values are already in sortable order; use them
+            // directly as the first source to avoid an extra copy.
+            // If descending, NOT into keys_a; otherwise skip — `keys_a`
+            // remains uninitialised but used as *destination* in pass 0.
+            if descending {
+                launch_not_u32(client, key.values(), height, &keys_a)?;
+            }
+            // For ascending U32, we use `key.values()` directly as src by
+            // aliasing: a thin copy would cost a kernel pass. Instead, treat
+            // the raw key as the initial source; the first scatter pass
+            // writes to `keys_b` — exactly what the ping-pong expects.
+        }
+        DType::U64 => {
+            if descending {
+                launch_not_u64(client, key.values(), height, &keys_a)?;
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    launch_fill_index(client, &indices, height)?;
+
+    // Allocate a scratch buffer for device-side offset computation. Reused
+    // across passes to avoid repeated alloc/free.
+    let scatter_offsets = alloc(client, num_blocks * RADIX_BINS as usize * 4);
+
+    // Step 2: LSD radix sort.
+    // Unsigned ascending is a special case: the raw key buffer (`key.values()`)
+    // is the initial source. All other paths use keys_a.
+    let mut src_keys = if matches!(key.dtype(), DType::U32 | DType::U64) && !descending {
+        key.values().clone()
+    } else {
+        keys_a
+    };
+    let mut dst_keys = keys_b;
+    let mut src_indices = indices;
+    let mut dst_indices = indices_scratch;
+
+    for pass_idx in 0..passes_usize {
+        let shift_u32 = (pass_idx as u32) * 8;
+        let shift_u64 = shift_u32 as u64;
+
+        match key.dtype() {
+            DType::I32 | DType::U32 => {
+                launch_radix_histogram_u32(client, &src_keys, height, &histograms, num_blocks, grid, shift_u32)?;
+                // Device-side prefix sum: no per-pass CUDA sync needed.
+                launch_radix_offsets(client, &histograms, &scatter_offsets, num_blocks)?;
+                launch_radix_scatter_u32(
+                    client, &src_keys, height, &src_indices, &scatter_offsets, &dst_keys,
+                    &dst_indices, num_blocks, grid, shift_u32,
+                )?;
+            }
+            DType::I64 | DType::U64 => {
+                launch_radix_histogram_u64(client, &src_keys, height, &histograms, num_blocks, grid, shift_u64)?;
+                launch_radix_offsets(client, &histograms, &scatter_offsets, num_blocks)?;
+                launch_radix_scatter_u64(
+                    client, &src_keys, height, &src_indices, &scatter_offsets, &dst_keys,
+                    &dst_indices, num_blocks, grid, shift_u64,
+                )?;
+            }
+            _ => unreachable!(),
+        }
+
+        std::mem::swap(&mut src_keys, &mut dst_keys);
+        std::mem::swap(&mut src_indices, &mut dst_indices);
+    }
+
+    // `src_indices` now holds the sorted permutation; recycle the scratch pair.
+    recycle_handle(dst_keys, height * elem_size);
+    recycle_handle(dst_indices, height * 4);
+    recycle_handle(histograms, num_blocks * RADIX_BINS as usize * 4);
+    recycle_handle(scatter_offsets, num_blocks * RADIX_BINS as usize * 4);
+    Ok(src_indices)
+}
+
+/// Download the key validity mask and check whether any entry is null (`0`).
+fn key_validity_has_nulls(
+    client: &Client,
+    key: &DeviceColumn,
+    height: usize,
+) -> Result<bool, ExecError> {
+    let bytes = client
+        .read_one(key.validity().clone())
+        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    Ok(bytes.iter().take(height).any(|&b| b == 0))
+}
+
+/// Host fallback: download the key column, compute the permutation on the
+/// CPU, and upload the index buffer to the device.
+fn gpu_sort_host_fallback(
+    client: &Client,
+    key: &DeviceColumn,
+    descending: bool,
+    nulls_last: bool,
+) -> Result<cubecl_runtime::server::Handle, ExecError> {
+    let key_host = download(client, key)?;
+    let height = key.len();
+    let mut permutation: Vec<u32> = (0..height).map(|i| i as u32).collect();
+    sort_permutation(key_host.values(), &key_host.validity(), descending, nulls_last, &mut permutation);
+    Ok(client.create_from_slice(bytemuck::cast_slice(&permutation)))
 }
 
 /// In-place compute a (stable) permutation that sorts `values` according to
@@ -1245,84 +1618,83 @@ fn compact_indices(
     Ok((indices, kept))
 }
 
-fn gather_column(
+/// Fused gather of both values and validity mask through `indices` in a
+/// single kernel launch. Replaces the separate `gather_column` + `gather_mask`
+/// calls used previously, halving kernel-launch overhead per column.
+fn gather_values_mask(
     client: &Client,
     column: &DeviceColumn,
     indices: &cubecl_runtime::server::Handle,
     kept: usize,
-) -> Result<cubecl_runtime::server::Handle, ExecError> {
+) -> Result<(cubecl_runtime::server::Handle, cubecl_runtime::server::Handle), ExecError> {
     if kept == 0 {
-        return Ok(alloc(client, 0));
+        return Ok((alloc(client, 0), alloc(client, 0)));
     }
-    let out = alloc(client, kept.saturating_mul(dtype_size(column.dtype())));
+    let out_values = alloc(client, kept.saturating_mul(dtype_size(column.dtype())));
+    let out_validity = alloc(client, kept);
     match column.dtype() {
-        DType::I32 => polars_cubecl_kernels::launch_gather::<i32>(
+        DType::I32 => polars_cubecl_kernels::launch_gather_values_mask::<i32>(
             client,
             column.values(),
             column.len(),
+            column.validity(),
             indices,
-            &out,
+            &out_values,
+            &out_validity,
             kept,
         )?,
-        DType::I64 => polars_cubecl_kernels::launch_gather::<i64>(
+        DType::I64 => polars_cubecl_kernels::launch_gather_values_mask::<i64>(
             client,
             column.values(),
             column.len(),
+            column.validity(),
             indices,
-            &out,
+            &out_values,
+            &out_validity,
             kept,
         )?,
-        DType::U32 => polars_cubecl_kernels::launch_gather::<u32>(
+        DType::U32 => polars_cubecl_kernels::launch_gather_values_mask::<u32>(
             client,
             column.values(),
             column.len(),
+            column.validity(),
             indices,
-            &out,
+            &out_values,
+            &out_validity,
             kept,
         )?,
-        // `F64` shares the `u64` kernel: movement is bitwise, so no
-        // arithmetic (and therefore no MSL `double`) is required.
-        DType::U64 | DType::F64 => polars_cubecl_kernels::launch_gather::<u64>(
+        DType::U64 | DType::F64 => polars_cubecl_kernels::launch_gather_values_mask::<u64>(
             client,
             column.values(),
             column.len(),
+            column.validity(),
             indices,
-            &out,
+            &out_values,
+            &out_validity,
             kept,
         )?,
-        DType::F32 => polars_cubecl_kernels::launch_gather::<f32>(
+        DType::F32 => polars_cubecl_kernels::launch_gather_values_mask::<f32>(
             client,
             column.values(),
             column.len(),
+            column.validity(),
             indices,
-            &out,
+            &out_values,
+            &out_validity,
             kept,
         )?,
-        DType::Bool => polars_cubecl_kernels::launch_gather::<u8>(
+        DType::Bool => polars_cubecl_kernels::launch_gather_values_mask::<u8>(
             client,
             column.values(),
             column.len(),
+            column.validity(),
             indices,
-            &out,
+            &out_values,
+            &out_validity,
             kept,
         )?,
     }
-    Ok(out)
-}
-
-fn gather_mask(
-    client: &Client,
-    handle: &cubecl_runtime::server::Handle,
-    source_len: usize,
-    indices: &cubecl_runtime::server::Handle,
-    kept: usize,
-) -> Result<cubecl_runtime::server::Handle, ExecError> {
-    if kept == 0 {
-        return Ok(alloc(client, 0));
-    }
-    let out = alloc(client, kept);
-    polars_cubecl_kernels::launch_gather::<u8>(client, handle, source_len, indices, &out, kept)?;
-    Ok(out)
+    Ok((out_values, out_validity))
 }
 
 fn slice_column(
@@ -1402,12 +1774,4 @@ fn slice_mask(
     let out = alloc(client, count);
     polars_cubecl_kernels::launch_slice::<u8>(client, handle, source_len, &out, start, count)?;
     Ok(out)
-}
-
-pub(crate) const fn dtype_size(dtype: DType) -> usize {
-    match dtype {
-        DType::I32 | DType::U32 | DType::F32 => 4,
-        DType::I64 | DType::U64 | DType::F64 => 8,
-        DType::Bool => 1,
-    }
 }

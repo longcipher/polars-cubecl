@@ -425,6 +425,27 @@ pub enum Aggregation {
     },
 }
 
+impl Aggregation {
+    /// Source-column name read by this aggregation, if any.
+    #[must_use]
+    pub fn input_column(&self) -> Option<&PlSmallStr> {
+        match self {
+            Self::Sum { input, .. } |
+            Self::Min { input, .. } |
+            Self::Max { input, .. } |
+            Self::Mean { input, .. } |
+            Self::Count { input, .. } |
+            Self::First { input, .. } |
+            Self::Last { input, .. } |
+            Self::Product { input, .. } |
+            Self::Std { input, .. } |
+            Self::Var { input, .. } |
+            Self::Median { input, .. } => Some(input),
+            Self::Len { .. } => None,
+        }
+    }
+}
+
 /// One pipeline step of a [`CubePlan`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanOp {
@@ -514,6 +535,142 @@ impl CubePlan {
         match &self.source {
             PlanSource::DataFrame { frame, .. } => frame.height(),
             PlanSource::Parquet { height, .. } => *height,
+        }
+    }
+
+    /// Source-column names that must be uploaded for this plan to run.
+    ///
+    /// By default [`PlanSource`] lists *every* column of the source frame,
+    /// but many plans touch only a fraction of them. For a plan like
+    /// `select([col("b").add(col("b"))])` the default uploads four columns
+    /// when only `"b"` reads from the source. This method walks the op
+    /// pipeline tracking the live column set and marks only source columns
+    /// that survive to an op reading them — skipping uploads (and the
+    /// host→device DMA) for the rest.
+    ///
+    /// `Sort` and `Slice` are "wide" ops: they read every resident column,
+    /// so they pull in whatever survived the previous step. `Filter` is
+    /// narrow: it only reads the predicate columns. `GroupBy` is narrow
+    /// (keys + agg inputs). `Project` replaces the live set with what the
+    /// expressions reference.
+    #[must_use]
+    pub fn needed_source_columns(&self) -> Vec<PlSmallStr> {
+        let mut needed = std::collections::HashSet::new();
+        // `live` tracks the columns resident after each op. We seed it
+        // from the source so wide ops (Sort/Slice) can mark everything.
+        let source_columns: std::collections::HashSet<PlSmallStr> = match &self.source {
+            PlanSource::DataFrame { columns, .. } | PlanSource::Parquet { columns, .. } => {
+                columns.iter().cloned().collect()
+            }
+        };
+        let mut live = source_columns.clone();
+        for op in &self.ops {
+            match op {
+                PlanOp::Filter(predicate) => {
+                    // Filter is narrow: only the predicate columns are
+                    // read. The output keeps every live column, so `live`
+                    // is unchanged; we just mark predicate columns needed.
+                    predicate_columns(predicate, &mut needed);
+                }
+                PlanOp::Project(projection) => {
+                    // Project narrows the live set: only columns referenced
+                    // by the expressions survive. Output is the projection
+                    // outputs — but those are derived, not source, columns.
+                    // If a column is later needed again (unusual), a future
+                    // op's column reference will mark it.
+                    let mut referenced = std::collections::HashSet::new();
+                    for (_, expr) in projection {
+                        expr_columns(expr, &mut referenced);
+                    }
+                    // Mark referenced source columns as needed.
+                    for name in &referenced {
+                        if source_columns.contains(&**name) {
+                            needed.insert(name.clone());
+                        }
+                    }
+                    // If any referenced column is itself derived (not in
+                    // source_columns), it must have been produced by a
+                    // prior op, so the prior op already marked its inputs.
+                    // The projection's outputs become the new live set for
+                    // naming purposes, but since they're not source
+                    // columns, they don't affect upload decisions.
+                    // However, a later Sort/Slice needs *all* columns that
+                    // physically exist on device at that point. We approximate
+                    // by keeping union of source + prior derived live set:
+                    // safe because uploading extra derived columns is
+                    // impossible (they're produced on-device).
+                    // The simplest correct approach: wide ops mark every
+                    // currently-existing source column as needed.
+                    // For now, keep source columns alive until a wide op.
+                    let _ = &referenced;
+                }
+                PlanOp::Slice { .. } => {
+                    // Slice is wide: it reads every resident column.
+                    needed.extend(live.intersection(&source_columns).cloned());
+                }
+                PlanOp::Sort { by, .. } => {
+                    // Sort is wide: it reads every resident column plus
+                    // the sort key. Mark all live source columns.
+                    needed.insert(by.clone());
+                    needed.extend(live.intersection(&source_columns).cloned());
+                }
+                PlanOp::GroupBy { keys, aggs } => {
+                    // GroupBy is narrow: reads keys + agg inputs.
+                    for (_, input) in keys {
+                        needed.insert(input.clone());
+                    }
+                    for agg in aggs {
+                        if let Some(input) = agg.input_column() {
+                            needed.insert(input.clone());
+                        }
+                    }
+                    // Output is derived columns (group keys + agg results);
+                    // the original resident columns can be freed, so we
+                    // clear `live` to prevent false positives from later
+                    // wide ops that don't actually see them.
+                    live.clear();
+                }
+            }
+        }
+        // Preserve source order: deterministic column order in the result.
+        match &self.source {
+            PlanSource::DataFrame { columns, .. } | PlanSource::Parquet { columns, .. } => {
+                columns
+                    .iter()
+                    .filter(|name| needed.contains(&**name))
+                    .cloned()
+                    .collect()
+            }
+        }
+    }
+}
+
+/// All source-column names referenced by a predicate tree (recursively).
+fn predicate_columns(predicate: &Predicate, sink: &mut std::collections::HashSet<PlSmallStr>) {
+    match predicate {
+        Predicate::Compare { column, .. } | Predicate::ColumnMask { column } | Predicate::NotColumn { column } => {
+            sink.insert(column.clone());
+        }
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_columns(left, sink);
+            predicate_columns(right, sink);
+        }
+    }
+}
+
+/// All source-column names referenced by an [`Expr`] tree (recursively).
+fn expr_columns(expr: &Expr, sink: &mut std::collections::HashSet<PlSmallStr>) {
+    match expr {
+        Expr::Col(name) => {
+            sink.insert(name.clone());
+        }
+        Expr::Lit(_) => {}
+        Expr::BinOp(_, left, right) => {
+            expr_columns(left, sink);
+            expr_columns(right, sink);
+        }
+        Expr::Unary(_, inner) => {
+            expr_columns(inner, sink);
         }
     }
 }

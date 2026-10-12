@@ -1,0 +1,31 @@
+[package]
+name = "cudf-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["polars-cubecl/cpu"]
+cuda = ["polars-cubecl/cuda"]
+hip = ["polars-cubecl/hip"]
+metal = ["polars-cubecl/metal"]
+metal-native = ["polars-cubecl/metal-native"]
+vulkan = ["polars-cubecl/vulkan"]
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+criterion = { workspace = true }
+eyre = { workspace = true }
+polars-core = { workspace = true }
+polars-cubecl = { workspace = true }
+polars-lazy = { workspace = true }
+polars-utils = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "cudf_compare"
+harness = false

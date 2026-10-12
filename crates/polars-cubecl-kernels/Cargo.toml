@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytemuck = { workspace = true }
 cubecl = { workspace = true }
 cubecl-runtime = { workspace = true }
 thiserror = { workspace = true }
