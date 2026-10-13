@@ -118,10 +118,10 @@ fn group_rows(key_columns: &[HostColumn]) -> Grouping {
             match col.dtype() {
                 DType::I32 => {
                     let HostValues::I32(values) = col.values() else { unreachable!() };
-                    let (min, max) = values.iter().take(height).fold(
-                        (i32::MAX, i32::MIN),
-                        |(min, max), &v| (min.min(v), max.max(v)),
-                    );
+                    let (min, max) = values
+                        .iter()
+                        .take(height)
+                        .fold((i32::MAX, i32::MIN), |(min, max), &v| (min.min(v), max.max(v)));
                     let range = (max as i64 - min as i64 + 1).max(0) as usize;
                     if range > 0 && range <= 65536 {
                         return group_single_dense_i32(values, height, min, range);
@@ -129,10 +129,10 @@ fn group_rows(key_columns: &[HostColumn]) -> Grouping {
                 }
                 DType::I64 => {
                     let HostValues::I64(i64_values) = col.values() else { unreachable!() };
-                    let (min, max) = i64_values.iter().take(height).fold(
-                        (i64::MAX, i64::MIN),
-                        |(min, max), &v| (min.min(v), max.max(v)),
-                    );
+                    let (min, max) = i64_values
+                        .iter()
+                        .take(height)
+                        .fold((i64::MAX, i64::MIN), |(min, max), &v| (min.min(v), max.max(v)));
                     let range = (max - min + 1).max(0) as usize;
                     if range > 0 && range <= 65536 {
                         return group_single_dense_i64(i64_values, height, min, range);
@@ -174,14 +174,7 @@ fn group_single_dense_i32(values: &[i32], height: usize, min: i32, range: usize)
         last_rows[id as usize] = row as u32;
         assignment.push(id);
     }
-        Grouping {
-            height,
-            assignment,
-            gpu_assignment: None,
-            sizes,
-            first_rows,
-            last_rows,
-        }
+    Grouping { height, assignment, gpu_assignment: None, sizes, first_rows, last_rows }
 }
 
 /// Dense direct-indexing grouping for non-null `i64` keys; same approach as
@@ -209,14 +202,7 @@ fn group_single_dense_i64(values: &[i64], height: usize, min: i64, range: usize)
         last_rows[id as usize] = row as u32;
         assignment.push(id);
     }
-    Grouping {
-        height,
-        assignment,
-        gpu_assignment: None,
-        sizes,
-        first_rows,
-        last_rows,
-    }
+    Grouping { height, assignment, gpu_assignment: None, sizes, first_rows, last_rows }
 }
 
 fn group_single(column: &HostColumn, height: usize) -> Grouping {
@@ -238,14 +224,7 @@ fn group_single(column: &HostColumn, height: usize) -> Grouping {
         last_rows[id as usize] = row as u32;
         assignment.push(id);
     }
-    Grouping {
-        height,
-        assignment,
-        gpu_assignment: None,
-        sizes,
-        first_rows,
-        last_rows,
-    }
+    Grouping { height, assignment, gpu_assignment: None, sizes, first_rows, last_rows }
 }
 
 fn group_multi(key_columns: &[HostColumn], height: usize) -> Grouping {
@@ -271,14 +250,7 @@ fn group_multi(key_columns: &[HostColumn], height: usize) -> Grouping {
         last_rows[id as usize] = row as u32;
         assignment.push(id);
     }
-    Grouping {
-        height,
-        assignment,
-        gpu_assignment: None,
-        sizes,
-        first_rows,
-        last_rows,
-    }
+    Grouping { height, assignment, gpu_assignment: None, sizes, first_rows, last_rows }
 }
 
 /// Maximum key range for which the GPU histogram path is used. Beyond this,
@@ -296,8 +268,8 @@ const GPU_HISTOGRAM_MAX_BUCKETS: usize = 65536;
 /// 3. `launch_reduce_max::<i32>` with one group → global max.
 /// 4. Read back min+max (8 bytes, one sync).
 /// 5. Launch GPU histogram; read back counts (`num_buckets * 4` bytes).
-/// 6. Build Grouping from counts + a GPU kernel that computes per-row
-///    `assignment[row] = (keys[row] - min_val) as u32` on the device.
+/// 6. Build Grouping from counts + a GPU kernel that computes per-row `assignment[row] = (keys[row]
+///    - min_val) as u32` on the device.
 fn try_gpu_histogram_grouping(
     client: &Client,
     key_col: &DeviceColumn,
@@ -311,56 +283,32 @@ fn try_gpu_histogram_grouping(
         return Ok(None); // nulls: fall back to host path
     }
 
-    // 2–3. Global min + max in one group:
-    //    seg_off=[0], seg_len=[height], all rows → group 0.
-    let seg_off_handle: Handle = client.create_from_slice(bytemuck::cast_slice(&[0_u32]));
-    let seg_len_handle: Handle =
-        client.create_from_slice(bytemuck::cast_slice(&[height as u32]));
-    let slots_handle: Handle = alloc(client, height.saturating_mul(4));
+    // 2–3. Fused global min+max in a single launch (CubeK-style kernel fusion).
+    //    Direct mode: reads values[k] directly in [0, height) — no slot
+    //    indirection needed for a contiguous segment. Also avoids the
+    //    buffer-pool uninit-read hazard from stale slot data.
+    //    One kernel launch instead of two — eliminates ~500µs CUDA startup.
 
     let min_val_handle = alloc(client, 4);
-    let min_valid_handle = alloc(client, 1);
-    let min_params = polars_cubecl_kernels::ReduceParams {
-        slots: &slots_handle,
-        seg_off: &seg_off_handle,
-        seg_len: &seg_len_handle,
-        num_groups: 1,
-        out_values: &min_val_handle,
-        out_valid: &min_valid_handle,
-    };
-    polars_cubecl_kernels::launch_reduce_min::<i32>(
-        client,
-        key_col.values(),
-        key_col.validity(),
-        height,
-        min_params,
-    )?;
-
     let max_val_handle = alloc(client, 4);
-    let max_valid_handle = alloc(client, 1);
-    let max_params = polars_cubecl_kernels::ReduceParams {
-        slots: &slots_handle,
-        seg_off: &seg_off_handle,
-        seg_len: &seg_len_handle,
-        num_groups: 1,
-        out_values: &max_val_handle,
-        out_valid: &max_valid_handle,
-    };
-    polars_cubecl_kernels::launch_reduce_max::<i32>(
+    let minmax_valid_handle = alloc(client, 1);
+    polars_cubecl_kernels::launch_reduce_min_max_direct::<i32>(
         client,
         key_col.values(),
         key_col.validity(),
         height,
-        max_params,
+        0,
+        height as u32,
+        &min_val_handle,
+        &max_val_handle,
+        &minmax_valid_handle,
     )?;
 
     // 4. Read back min + max (8 bytes total).
-    let min_bytes = client
-        .read_one(min_val_handle)
-        .map_err(|error| ExecError::Launch(error.to_string()))?;
-    let max_bytes = client
-        .read_one(max_val_handle)
-        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    let min_bytes =
+        client.read_one(min_val_handle).map_err(|error| ExecError::Launch(error.to_string()))?;
+    let max_bytes =
+        client.read_one(max_val_handle).map_err(|error| ExecError::Launch(error.to_string()))?;
     let min_val = bytemuck::cast_slice::<u8, i32>(&min_bytes[..4])[0];
     let max_val = bytemuck::cast_slice::<u8, i32>(&max_bytes[..4])[0];
 
@@ -369,52 +317,70 @@ fn try_gpu_histogram_grouping(
         return Ok(None);
     }
 
-    // 5. GPU histogram.
+    // 5–6. Fused GPU histogram + group-id assignment in a single launch
+    //    (CubeK-style kernel fusion). Computes bucket counts and per-row
+    //    assignment with one read of keys, saving ~500µs CUDA launch overhead
+    //    vs separate kernels. The `out[row] = bucket` writes are
+    //    deterministic (each thread writes its own index); first/last rows
+    //    are computed on the CPU from the read-back assignment, avoiding
+    //    non-determinism from atomic counters in group_invert.
     let num_buckets = range;
     let min_scalar: Handle = client.create_from_slice(bytemuck::cast_slice(&[min_val]));
     let histo_counts = alloc(client, num_buckets.saturating_mul(4));
-    polars_cubecl_kernels::launch_gpu_histogram(
+    let assignment_handle = alloc(client, height.saturating_mul(4));
+    polars_cubecl_kernels::launch_gpu_histogram_and_assign(
         client,
         key_col.values(),
         &min_scalar,
         &histo_counts,
+        &assignment_handle,
         height,
         num_buckets,
     )?;
-    let counts_bytes = client
-        .read_one(histo_counts)
-        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    let counts_bytes =
+        client.read_one(histo_counts).map_err(|error| ExecError::Launch(error.to_string()))?;
     let counts: &[u32] = bytemuck::cast_slice(&counts_bytes);
     let counts: Vec<u32> = counts.iter().take(num_buckets).copied().collect();
 
-    // 6. Build Grouping sizes and per-row assignment entirely on the GPU.
-    //    sizes = counts (filtering empty buckets).
-    //    assignment = GPU kernel computes `keys[row] - min` → dense group id.
+    // Read back the deterministic per-row assignment (4 * height bytes).
+    // `out[row] = bucket` is written by exactly one thread per row, so the
+    // result is reproducible across CPU and GPU backends.
+    let assign_bytes = client
+        .read_one(assignment_handle.clone())
+        .map_err(|error| ExecError::Launch(error.to_string()))?;
+    let assign_raw: &[u32] = bytemuck::cast_slice(&assign_bytes);
+
+    // Build Grouping sizes, first_rows, last_rows on the CPU from the
+    // deterministic assignment. The slots-based path in finish_grouping
+    // uses bucket id directly (= dense group id from the histogram), so we
+    // must use the same mapping here: per-bucket first/last, then filter to
+    // non-empty buckets in bucket id order.
+    let mut raw_first_rows = vec![u32::MAX; num_buckets];
+    let mut raw_last_rows = vec![u32::MAX; num_buckets];
+    for row in 0..height {
+        let bucket = assign_raw[row] as usize;
+        if raw_first_rows[bucket] == u32::MAX {
+            raw_first_rows[bucket] = row as u32;
+        }
+        raw_last_rows[bucket] = row as u32;
+    }
     let sizes: Vec<u32> = counts.iter().copied().filter(|&c| c > 0).collect();
     let num_groups = sizes.len();
     let mut first_rows = Vec::with_capacity(num_groups);
     let mut last_rows = Vec::with_capacity(num_groups);
-    let mut edge = 0_u32;
-    for &count in &sizes {
-        first_rows.push(edge);
-        last_rows.push(edge + count - 1);
-        edge = edge.saturating_add(count);
+    for bucket in 0..num_buckets {
+        if counts[bucket] > 0 {
+            first_rows.push(raw_first_rows[bucket]);
+            last_rows.push(raw_last_rows[bucket]);
+        }
     }
 
-    // GPU: compute `assignment[row] = (keys[row] - min) as u32`.
-    // The result stays on the GPU — finish_grouping reads the handle
-    // directly, avoiding a 4 * height byte host round-trip.
-    let assignment_handle = alloc(client, height.saturating_mul(4));
-    polars_cubecl_kernels::launch_keys_to_group_i32(
-        client,
-        key_col.values(),
-        &min_scalar,
-        &assignment_handle,
-        height,
-    )?;
+    // assignment_handle stays on the GPU — finish_grouping reads it
+    // directly, avoiding a redundant upload.
 
     // Recycle scratch handles.
     recycle_handle(min_scalar, 4);
+    recycle_handle(minmax_valid_handle, 1);
 
     Ok(Some(Grouping {
         height,
@@ -454,9 +420,7 @@ pub fn apply(
     if keys.len() == 1 {
         let key_col = &key_device_cols[0];
         if key_col.dtype() == DType::I32 && height > 0 {
-            if let Some(grouping) =
-                try_gpu_histogram_grouping(client, key_col, height)?
-            {
+            if let Some(grouping) = try_gpu_histogram_grouping(client, key_col, height)? {
                 return finish_grouping(client, f64_ok, columns, keys, aggs, grouping);
             }
         }
@@ -469,19 +433,24 @@ pub fn apply(
 }
 
 /// Shared tail path: given a `Grouping`, perform the invert + reductions.
+///
+/// When `grouping.gpu_assignment` is present (GPU histogram fast path),
+/// group-by-sum uses a direct atomic-add kernel that bypasses the
+/// group_invert + slots indirection — saving ~500µs CUDA launch overhead
+/// and one slots buffer allocation.
 fn finish_grouping(
     client: &Client,
     f64_ok: bool,
     columns: Vec<DeviceColumn>,
     keys: &[(PlSmallStr, PlSmallStr)],
     aggs: &[Aggregation],
-    grouping: Grouping,
+    mut grouping: Grouping,
 ) -> Result<Vec<DeviceColumn>, ExecError> {
     let num_groups = grouping.sizes.len();
     let height = grouping.height;
 
-    // Use the GPU-resident assignment handle directly when available; otherwise
-    // upload the host-side Vec<u32> to the device.
+    // Use the GPU-resident assignment handle directly when available;
+    // otherwise upload the host-side Vec<u32> to the device.
     let assignment = match grouping.gpu_assignment {
         Some(ref handle) => handle.clone(),
         None => create_slice(client, bytemuck::cast_slice(&grouping.assignment)),
@@ -494,6 +463,70 @@ fn finish_grouping(
     }
     let seg_off_handle = create_slice(client, bytemuck::cast_slice(&seg_off));
     let seg_len_handle = create_slice(client, bytemuck::cast_slice(&grouping.sizes));
+
+    // If every agg is Sum, we can skip group_invert entirely and use the
+    // direct-from-assignment atomic-add kernel (~500µs saved vs slot path).
+    // Otherwise, fall back to the traditional group_invert + slot-based path.
+    let all_sum = aggs.iter().all(|a| matches!(a, Aggregation::Sum { .. }));
+
+    if grouping.gpu_assignment.is_some() && all_sum {
+        // GPU histogram fast path, all-sum: skip group_invert entirely.
+        // Use direct atomic-add from the assignment vector — saves ~500µs
+        // CUDA launch overhead (group_invert) + one slots buffer.
+        let mut output = Vec::with_capacity(keys.len() + aggs.len());
+        output.extend(materialize_keys(client, &columns, keys, &grouping.first_rows, num_groups)?);
+        for agg in aggs {
+            let Aggregation::Sum { input, output: name } = agg else {
+                unreachable!("all agg are Sum by check above");
+            };
+            let col_index = find_column(&columns, input)?;
+            let source = &columns[col_index];
+            let dtype = source.dtype();
+            // Allocate + zero-fill output buffers in one step. The buffers
+            // are used as Atomic<T> / Atomic<u8> accumulators by the kernel.
+            macro_rules! do_sum {
+                ($t:ty) => {{
+                    let num_val_bytes = num_groups.saturating_mul(dtype_size(dtype));
+                    let val_buf = vec![0u8; num_val_bytes];
+                    let vld_buf = vec![0u8; num_groups];
+                    let out_values = create_slice(client, &val_buf);
+                    let out_valid = create_slice(client, &vld_buf);
+                    polars_cubecl_kernels::launch_reduce_sum_direct::<$t>(
+                        client,
+                        source.values(),
+                        source.validity(),
+                        &assignment,
+                        &out_values,
+                        &out_valid,
+                        height,
+                        num_groups,
+                    )?;
+                    (out_values, out_valid)
+                }};
+            }
+            let (out_values, out_valid) = match dtype {
+                DType::I32 => do_sum!(i32),
+                DType::I64 => do_sum!(i64),
+                DType::U32 => do_sum!(u32),
+                DType::U64 => do_sum!(u64),
+                DType::F32 => do_sum!(f32),
+                DType::F64 => do_sum!(f64),
+                DType::Bool => do_sum!(u8),
+                _ => {
+                    return Err(ExecError::NotExecutable(format!("direct sum for dtype {dtype:?}")))
+                }
+            };
+            output.push(DeviceColumn::from_handles(
+                name.clone(),
+                dtype,
+                out_values,
+                out_valid,
+                num_groups,
+            ));
+        }
+        return Ok(output);
+    }
+
     let zeros = vec![0_u32; num_groups];
     let seq = create_slice(client, bytemuck::cast_slice(&zeros));
     let slots = alloc(client, height.saturating_mul(4));
@@ -506,6 +539,34 @@ fn finish_grouping(
         height,
         num_groups,
     )?;
+
+    // For the GPU histogram path, first_rows and last_rows were not
+    // computed upfront. Derive both now from the slots array: within each
+    // group, group_invert preserves the original row order, so the first/
+    // last slots correspond to the first/last group rows.
+    if num_groups > 0 && grouping.first_rows.is_empty() && grouping.last_rows.is_empty() {
+        let slots_bytes =
+            client.read_one(slots.clone()).map_err(|error| ExecError::Launch(error.to_string()))?;
+        let slots_raw: &[u32] = bytemuck::cast_slice(&slots_bytes);
+        let mut first_rows = Vec::with_capacity(num_groups);
+        let mut last_rows = Vec::with_capacity(num_groups);
+        for g in 0..num_groups {
+            let first_slot_pos = seg_off[g] as usize;
+            let last_slot_pos = (seg_off[g] + grouping.sizes[g] - 1) as usize;
+            first_rows.push(slots_raw[first_slot_pos]);
+            last_rows.push(slots_raw[last_slot_pos]);
+        }
+        grouping.first_rows = first_rows;
+        grouping.last_rows = last_rows;
+    }
+
+    // Defensive: if for any reason we still have empty first/last rows
+    // (e.g. host-path grouping returned empty), populate with null values
+    // so downstream gather kernels do not index out of bounds.
+    if grouping.first_rows.is_empty() && num_groups > 0 {
+        grouping.first_rows = vec![0; num_groups];
+        grouping.last_rows = vec![0; num_groups];
+    }
 
     let mut output = Vec::with_capacity(keys.len() + aggs.len());
     output.extend(materialize_keys(client, &columns, keys, &grouping.first_rows, num_groups)?);
@@ -774,6 +835,13 @@ fn reduce_agg(
 
 /// Grouped sum in the input dtype (the CPU engine does not widen small
 /// sums). Returns the output dtype with its buffers.
+///
+/// NOTE: the parallel reduce_sum kernel (reduce_sum_parallel) was
+/// prototyped but benchmarks showed it was ~17% slower at 1M rows/64 groups
+/// (5.73 ms vs 4.89 ms serial). The CUDA launch overhead of 64 blocks plus
+/// the 256 serial global-memory reads by thread 0 outweighed the benefit of
+/// higher thread count. The parallel kernel is retained in the kernel crate
+/// for future use when a cross-block barrier is available.
 fn reduce_sum(
     client: &Client,
     columns: &[DeviceColumn],

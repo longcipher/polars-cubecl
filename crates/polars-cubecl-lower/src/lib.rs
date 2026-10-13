@@ -635,11 +635,7 @@ impl CubePlan {
         // Preserve source order: deterministic column order in the result.
         match &self.source {
             PlanSource::DataFrame { columns, .. } | PlanSource::Parquet { columns, .. } => {
-                columns
-                    .iter()
-                    .filter(|name| needed.contains(&**name))
-                    .cloned()
-                    .collect()
+                columns.iter().filter(|name| needed.contains(&**name)).cloned().collect()
             }
         }
     }
@@ -648,7 +644,9 @@ impl CubePlan {
 /// All source-column names referenced by a predicate tree (recursively).
 fn predicate_columns(predicate: &Predicate, sink: &mut std::collections::HashSet<PlSmallStr>) {
     match predicate {
-        Predicate::Compare { column, .. } | Predicate::ColumnMask { column } | Predicate::NotColumn { column } => {
+        Predicate::Compare { column, .. } |
+        Predicate::ColumnMask { column } |
+        Predicate::NotColumn { column } => {
             sink.insert(column.clone());
         }
         Predicate::And(left, right) | Predicate::Or(left, right) => {

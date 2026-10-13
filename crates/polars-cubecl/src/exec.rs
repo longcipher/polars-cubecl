@@ -26,8 +26,7 @@ use polars_cubecl_runtime::{RuntimeContext, supports_f64};
 use polars_utils::pl_str::PlSmallStr;
 use thiserror::Error;
 
-use crate::buffer_pool;
-use crate::groupby;
+use crate::{buffer_pool, groupby};
 
 /// Error returned when a lowered plan cannot be executed.
 #[derive(Debug, Error)]
@@ -885,8 +884,9 @@ fn apply_sort(
     // the GPU path win, it needs a multi-threaded parallel prefix-sum kernel
     // (work-efficient Blelloch scan) — tracked in Opt 3. Until then, all
     // downloads go through the host-cooperative path below.
-    let indices = if false && matches!(key.dtype(), DType::U32 | DType::U64 | DType::I32 | DType::I64)
-        && height >= _GPU_SORT_THRESHOLD
+    let indices = if false &&
+        matches!(key.dtype(), DType::U32 | DType::U64 | DType::I32 | DType::I64) &&
+        height >= _GPU_SORT_THRESHOLD
     {
         gpu_radix_sort_key_indices(client, key, descending, nulls_last)?
     } else {
@@ -976,7 +976,9 @@ fn permute_values(values: &HostValues, permutation: &[u32]) -> HostValues {
         HostValues::U64(v) => HostValues::U64(permutation.iter().map(|&i| v[i as usize]).collect()),
         HostValues::F32(v) => HostValues::F32(permutation.iter().map(|&i| v[i as usize]).collect()),
         HostValues::F64(v) => HostValues::F64(permutation.iter().map(|&i| v[i as usize]).collect()),
-        HostValues::Bool(v) => HostValues::Bool(permutation.iter().map(|&i| v[i as usize]).collect()),
+        HostValues::Bool(v) => {
+            HostValues::Bool(permutation.iter().map(|&i| v[i as usize]).collect())
+        }
     }
 }
 
@@ -1044,8 +1046,8 @@ fn gpu_radix_sort_key_indices(
     nulls_last: bool,
 ) -> Result<cubecl_runtime::server::Handle, ExecError> {
     use polars_cubecl_kernels::{
-        RADIX_BINS, RADIX_PASSES_U32, RADIX_PASSES_U64, launch_fill_index,
-        launch_not_u32, launch_not_u64, launch_radix_histogram_u32, launch_radix_histogram_u64,
+        RADIX_BINS, RADIX_PASSES_U32, RADIX_PASSES_U64, launch_fill_index, launch_not_u32,
+        launch_not_u64, launch_radix_histogram_u32, launch_radix_histogram_u64,
         launch_radix_offsets, launch_radix_scatter_u32, launch_radix_scatter_u64,
         launch_sign_flip_u32, launch_sign_flip_u64,
     };
@@ -1087,9 +1089,8 @@ fn gpu_radix_sort_key_indices(
 
     // Step 1: prepare a sortable key buffer.
     //   - Signed types: sign-flip → keys_a (so i32/i64 sort as unsigned).
-    //   - Unsigned types: identity. We read directly into keys_a via the
-    //     ping-pong's second buffer, then swap pointers so keys_a is the
-    //     working source.
+    //   - Unsigned types: identity. We read directly into keys_a via the ping-pong's second buffer,
+    //     then swap pointers so keys_a is the working source.
     // For descending: additionally NOT the prepared key right after, which
     // reverses unsigned ordering within the same buffer pair.
     match key.dtype() {
@@ -1152,20 +1153,52 @@ fn gpu_radix_sort_key_indices(
 
         match key.dtype() {
             DType::I32 | DType::U32 => {
-                launch_radix_histogram_u32(client, &src_keys, height, &histograms, num_blocks, grid, shift_u32)?;
+                launch_radix_histogram_u32(
+                    client,
+                    &src_keys,
+                    height,
+                    &histograms,
+                    num_blocks,
+                    grid,
+                    shift_u32,
+                )?;
                 // Device-side prefix sum: no per-pass CUDA sync needed.
                 launch_radix_offsets(client, &histograms, &scatter_offsets, num_blocks)?;
                 launch_radix_scatter_u32(
-                    client, &src_keys, height, &src_indices, &scatter_offsets, &dst_keys,
-                    &dst_indices, num_blocks, grid, shift_u32,
+                    client,
+                    &src_keys,
+                    height,
+                    &src_indices,
+                    &scatter_offsets,
+                    &dst_keys,
+                    &dst_indices,
+                    num_blocks,
+                    grid,
+                    shift_u32,
                 )?;
             }
             DType::I64 | DType::U64 => {
-                launch_radix_histogram_u64(client, &src_keys, height, &histograms, num_blocks, grid, shift_u64)?;
+                launch_radix_histogram_u64(
+                    client,
+                    &src_keys,
+                    height,
+                    &histograms,
+                    num_blocks,
+                    grid,
+                    shift_u64,
+                )?;
                 launch_radix_offsets(client, &histograms, &scatter_offsets, num_blocks)?;
                 launch_radix_scatter_u64(
-                    client, &src_keys, height, &src_indices, &scatter_offsets, &dst_keys,
-                    &dst_indices, num_blocks, grid, shift_u64,
+                    client,
+                    &src_keys,
+                    height,
+                    &src_indices,
+                    &scatter_offsets,
+                    &dst_keys,
+                    &dst_indices,
+                    num_blocks,
+                    grid,
+                    shift_u64,
                 )?;
             }
             _ => unreachable!(),
@@ -1206,7 +1239,13 @@ fn gpu_sort_host_fallback(
     let key_host = download(client, key)?;
     let height = key.len();
     let mut permutation: Vec<u32> = (0..height).map(|i| i as u32).collect();
-    sort_permutation(key_host.values(), &key_host.validity(), descending, nulls_last, &mut permutation);
+    sort_permutation(
+        key_host.values(),
+        &key_host.validity(),
+        descending,
+        nulls_last,
+        &mut permutation,
+    );
     Ok(client.create_from_slice(bytemuck::cast_slice(&permutation)))
 }
 

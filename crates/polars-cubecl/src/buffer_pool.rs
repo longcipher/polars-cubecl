@@ -17,8 +17,7 @@
 //! prevents silent buffer-overflow when `bucket_key` maps distinct request
 //! sizes to the same bucket.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 use cubecl_runtime::server::Handle;
 

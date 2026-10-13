@@ -167,25 +167,25 @@ impl HostValues {
         }
     }
 
-/// Whether the column has no rows.
-#[must_use]
-pub fn is_empty(&self) -> bool {
-    self.len() == 0
-}
-
-/// View the values as a `&[u8]` of their packed little-endian representation.
-#[must_use]
-pub fn to_bytes(&self) -> Vec<u8> {
-    match self {
-        Self::I32(v) => bytemuck::cast_slice(v).to_vec(),
-        Self::I64(v) => bytemuck::cast_slice(v).to_vec(),
-        Self::U32(v) => bytemuck::cast_slice(v).to_vec(),
-        Self::U64(v) => bytemuck::cast_slice(v).to_vec(),
-        Self::F32(v) => bytemuck::cast_slice(v).to_vec(),
-        Self::F64(v) => bytemuck::cast_slice(v).to_vec(),
-        Self::Bool(v) => v.clone(),
+    /// Whether the column has no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
-}
+
+    /// View the values as a `&[u8]` of their packed little-endian representation.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::I32(v) => bytemuck::cast_slice(v).to_vec(),
+            Self::I64(v) => bytemuck::cast_slice(v).to_vec(),
+            Self::U32(v) => bytemuck::cast_slice(v).to_vec(),
+            Self::U64(v) => bytemuck::cast_slice(v).to_vec(),
+            Self::F32(v) => bytemuck::cast_slice(v).to_vec(),
+            Self::F64(v) => bytemuck::cast_slice(v).to_vec(),
+            Self::Bool(v) => v.clone(),
+        }
+    }
 }
 
 /// One column in canonical host form: dense values plus a `u8` validity mask.
@@ -419,12 +419,7 @@ pub fn download(client: &Client, column: &DeviceColumn) -> Result<HostColumn, Bu
         }
     };
     let validity = validity_bytes[..len.min(validity_bytes.len())].to_vec();
-    Ok(HostColumn {
-        name: column.name.clone(),
-        dtype: column.dtype,
-        values,
-        validity,
-    })
+    Ok(HostColumn { name: column.name.clone(), dtype: column.dtype, values, validity })
 }
 
 /// Download multiple device columns to host in a single batched readback.
@@ -443,9 +438,7 @@ pub fn download_columns(
         handles.push(column.values.clone());
         handles.push(column.validity.clone());
     }
-    let batch = client
-        .read(handles)
-        .map_err(|error| BufferError::Readback(error.to_string()))?;
+    let batch = client.read(handles).map_err(|error| BufferError::Readback(error.to_string()))?;
     let mut out = Vec::with_capacity(columns.len());
     for (column, chunks) in columns.iter().zip(batch.chunks_exact(2)) {
         out.push(build_host_column(column, &chunks[0], &chunks[1])?);
@@ -509,9 +502,7 @@ pub fn download_frame(client: &Client, columns: &[DeviceColumn]) -> Result<DataF
     }
 
     // Single readback round-trip.
-    let batch = client
-        .read(handles)
-        .map_err(|error| BufferError::Readback(error.to_string()))?;
+    let batch = client.read(handles).map_err(|error| BufferError::Readback(error.to_string()))?;
 
     // Rebuild host columns interleaving value / validity chunks from the
     // batch result.
@@ -535,23 +526,30 @@ fn build_host_column(
 ) -> Result<HostColumn, BufferError> {
     let (name, dtype, len) = (column.name.clone(), column.dtype, column.len());
     if len == 0 {
-        return Ok(HostColumn {
-            name,
-            dtype,
-            values: empty_values(dtype, 0),
-            validity: Vec::new(),
-        });
+        return Ok(HostColumn { name, dtype, values: empty_values(dtype, 0), validity: Vec::new() });
     }
     // Truncate to `len` elements in case the pooled handle is larger.
     let type_size = dtype.size();
     let value_len = len.saturating_mul(type_size);
     let values = match dtype {
-        DType::I32 => HostValues::I32(i32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
-        DType::I64 => HostValues::I64(i64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
-        DType::U32 => HostValues::U32(u32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
-        DType::U64 => HostValues::U64(u64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
-        DType::F32 => HostValues::F32(f32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
-        DType::F64 => HostValues::F64(f64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec()),
+        DType::I32 => HostValues::I32(
+            i32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec(),
+        ),
+        DType::I64 => HostValues::I64(
+            i64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec(),
+        ),
+        DType::U32 => HostValues::U32(
+            u32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec(),
+        ),
+        DType::U64 => HostValues::U64(
+            u64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec(),
+        ),
+        DType::F32 => HostValues::F32(
+            f32::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec(),
+        ),
+        DType::F64 => HostValues::F64(
+            f64::from_bytes(&value_bytes[..value_len.min(value_bytes.len())]).to_vec(),
+        ),
         DType::Bool => HostValues::Bool(value_bytes[..value_len.min(value_bytes.len())].to_vec()),
     };
     let validity = validity_bytes[..len.min(validity_bytes.len())].to_vec();

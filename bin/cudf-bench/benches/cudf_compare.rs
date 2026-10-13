@@ -12,15 +12,16 @@
 //! Run with `cargo bench -p cudf-bench` (add `--features metal` on Apple
 //! Silicon, `--features cuda` on NVIDIA, etc.)
 
-use std::{hint::black_box, ops::Add, time::Duration};
-
-use std::ops::Mul;
+use std::{
+    hint::black_box,
+    ops::{Add, Mul},
+    time::Duration,
+};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use polars_core::prelude::SortMultipleOptions;
 use polars_core::{
     frame::DataFrame,
-    prelude::{NamedFrom, Series},
+    prelude::{NamedFrom, Series, SortMultipleOptions},
 };
 use polars_cubecl::{CubeclEngine, EngineConfig};
 use polars_lazy::{
@@ -314,11 +315,7 @@ fn bench_group_by(criterion: &mut Criterion) {
             bencher.iter(|| {
                 let out = eng
                     .collect_strict(
-                        frame
-                            .clone()
-                            .lazy()
-                            .group_by([col("g")])
-                            .agg([col("b").mean().alias("m")]),
+                        frame.clone().lazy().group_by([col("g")]).agg([col("b").mean().alias("m")]),
                     )
                     .unwrap_or(DataFrame::empty_with_height(0));
                 black_box(out);
