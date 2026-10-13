@@ -68,3 +68,20 @@ cargo bench -p polars-cubecl --features metal --bench engine
 
 Benchmarks are reported, never asserted: they exist to make performance
 claims falsifiable, not to gate CI.
+
+## Pipeline-Level Bottleneck Analysis
+
+A detailed breakdown of per-operation kernel launches, sync points, DMA
+timing, and ranked optimization opportunities lives in
+[`perf_bottleneck_analysis.md`](perf_bottleneck_analysis.md). Key findings
+(as of 2026-10-13, post GPU-histogram + direct-sum):
+
+| Operation | Launch overhead | Sync overhead | Kernel compute | Total est. |
+|-----------|----------------|---------------|----------------|------------|
+| Filter (1M) | ~3.0 ms (6 launches) | ~1.0 ms (2 syncs) | ~0.1 ms | ~4–7 ms |
+| Group-by sum (1M/64) | ~2.0 ms (4 launches) | ~1.5 ms (3 syncs) | ~4.9 ms | ~9–15 ms |
+
+The three highest-ROI optimizations are:
+1. **Vectorize reduce_sum** (kernel: 4.9 ms → 1.2 ms)
+2. **Kernel fusion** (filter: 3 launches → 1 launch; saves ~1.5 ms)
+3. **Batch histogram readbacks** (group-by: 3 syncs → 1 sync; saves ~1.0 ms)
