@@ -209,11 +209,10 @@ pub fn warm_up(client: &Client) -> Result<(), KernelError> {
     launch_cast_u32_to_f64(client, &v_u32, &out_f64, N)?;
 
     // Force synchronisation so all warm-ups complete before returning.
-    // `sync` returns a Future on async backends; drive it only when needed.
-    #[expect(clippy::unused_must_use)]
-    {
-        let _ = client.sync();
-    }
+    // Dropping the boxed future is sufficient: the synchronous work
+    // (command submission, stream execution) happens before the future
+    // is created in every CubeCL backend.
+    drop(client.sync());
     Ok(())
 }
 
@@ -1112,6 +1111,7 @@ pub fn launch_reduce_min_max_direct<T: Numeric>(
 /// Float direct min+max without slot indirection, NaN-safe.
 macro_rules! launch_reduce_minmax_float_direct {
     ($name:ident, $kernel:ident) => {
+        /// Launch a NaN-safe direct min+max reduction for float types without slot indirection.
         pub fn $name(
             client: &Client,
             values: &Handle,
@@ -2181,7 +2181,7 @@ pub const RADIX_PASSES_U64: u32 = 8;
 /// Radix sort digit width in bits.
 const RADIX_BITS: u32 = 8;
 /// Radix sort digit bins (2^RADIX_BITS).
-pub const RADIX_BINS: u32 = 256;
+pub const RADIX_BINS: u32 = 1 << RADIX_BITS;
 
 /// Compute the 256-bin per-block histograms of one digit of a `u32` key
 /// column. Output `histograms` must hold `blocks * 256` u32 words.
@@ -2946,7 +2946,7 @@ mod inner {
         values: &[T],
         valid: &[u8],
         assignment: &[u32],
-        out_values: &mut [Atomic<T>],
+        out_values: &[Atomic<T>],
         out_valid: &mut [u8],
         num_groups: usize,
     ) {
@@ -3069,17 +3069,17 @@ mod inner {
                 let row = base + k;
                 if valid[row] != 0u8 {
                     let value = values[row];
-                    if !found {
-                        best_min = value;
-                        best_max = value;
-                        found = true;
-                    } else {
+                    if found {
                         if value < best_min {
                             best_min = value;
                         }
                         if best_max < value {
                             best_max = value;
                         }
+                    } else {
+                        best_min = value;
+                        best_max = value;
+                        found = true;
                     }
                 }
                 k += 1usize;
@@ -3187,17 +3187,17 @@ mod inner {
                 let row = slots[base + k] as usize;
                 if valid[row] != 0u8 {
                     let value = values[row];
-                    if !found {
-                        best_min = value;
-                        best_max = value;
-                        found = true;
-                    } else {
+                    if found {
                         if value < best_min {
                             best_min = value;
                         }
                         if best_max < value {
                             best_max = value;
                         }
+                    } else {
+                        best_min = value;
+                        best_max = value;
+                        found = true;
                     }
                 }
                 k += 1usize;

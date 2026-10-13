@@ -91,9 +91,8 @@ fn unsupported_query_falls_back_cleanly() -> Result<(), HarnessError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-    #[test]
-    fn filter_i32_threshold_property(
+#[test]
+fn filter_i32_threshold_property(
         values in proptest::collection::vec(proptest::option::of(any::<i32>()), 0..256),
         threshold in any::<i32>(),
     ) {
@@ -109,9 +108,8 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
-    #[test]
-    fn filter_u32_threshold_property(
+#[test]
+fn filter_u32_threshold_property(
         values in proptest::collection::vec(proptest::option::of(any::<u32>()), 0..256),
         threshold in any::<u32>(),
     ) {
@@ -127,9 +125,8 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
-    #[test]
-    fn filter_f32_threshold_property(
+#[test]
+fn filter_f32_threshold_property(
         values in proptest::collection::vec(proptest::option::of(any::<f32>()), 0..128),
         threshold in any::<f32>(),
     ) {

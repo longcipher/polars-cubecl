@@ -82,6 +82,7 @@ timing, and ranked optimization opportunities lives in
 | Group-by sum (1M/64) | ~2.0 ms (4 launches) | ~0.5 ms (1 sync) | ~4.9 ms | ~7–12 ms |
 
 Implemented optimizations (P0–P3):
+
 1. **P0 — 4× unrolled reduce_sum**: kernel now processes 4 rows/thread
    (3906 → 977 blocks at 1M rows); reduced CUDA block-scheduling overhead.
 2. **P2 — Batched histogram readbacks**: 3 syncs → 1 sync in the histogram

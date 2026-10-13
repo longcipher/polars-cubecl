@@ -313,7 +313,6 @@ fn group_large_cardinality_scales_match_oracle() -> Result<(), HarnessError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
     #[test]
     fn groupby_agg_property(
         rows in 0..512_usize,

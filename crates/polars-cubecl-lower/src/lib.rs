@@ -563,14 +563,23 @@ impl CubePlan {
                 columns.iter().cloned().collect()
             }
         };
+        // Pure passthrough (no ops): every source column must be uploaded
+        // so the result frame has the same shape as the source.
+        if self.ops.is_empty() {
+            needed.clone_from(&source_columns);
+        }
         let mut live = source_columns.clone();
         for op in &self.ops {
             match op {
                 PlanOp::Filter(predicate) => {
-                    // Filter is narrow: only the predicate columns are
-                    // read. The output keeps every live column, so `live`
-                    // is unchanged; we just mark predicate columns needed.
+                    // Filter is narrow in reads but wide in writes: the
+                    // predicate columns are read, but the output keeps every
+                    // live source column. Mark both predicate columns and all
+                    // currently-live source columns as needed — otherwise
+                    // columns not referenced by the predicate are dropped
+                    // from the result.
                     predicate_columns(predicate, &mut needed);
+                    needed.extend(live.intersection(&source_columns).cloned());
                 }
                 PlanOp::Project(projection) => {
                     // Project narrows the live set: only columns referenced

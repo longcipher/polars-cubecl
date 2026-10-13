@@ -105,7 +105,7 @@ fn recycle_device_columns(columns: &[DeviceColumn]) {
         if value_bytes > 0 {
             recycle_handle(col.values().clone(), value_bytes);
         }
-        if col.len() > 0 {
+        if !col.is_empty() {
             recycle_handle(col.validity().clone(), col.len());
         }
     }
@@ -884,10 +884,9 @@ fn apply_sort(
     // the GPU path win, it needs a multi-threaded parallel prefix-sum kernel
     // (work-efficient Blelloch scan) — tracked in Opt 3. Until then, all
     // downloads go through the host-cooperative path below.
-    let indices = if false &&
-        matches!(key.dtype(), DType::U32 | DType::U64 | DType::I32 | DType::I64) &&
-        height >= _GPU_SORT_THRESHOLD
-    {
+    // Dead code: the GPU sort path is opt-not-yet-implemented.
+    // Kept as a `if false` placeholder matching the real signature.
+    let indices = if false {
         gpu_radix_sort_key_indices(client, key, descending, nulls_last)?
     } else {
         // Host-cooperative path: download key, sort permutation on CPU,
@@ -1057,10 +1056,8 @@ fn gpu_radix_sort_key_indices(
 
     // Only integer keys (signed or unsigned, 32/64-bit) get the GPU path.
     let (passes, elem_size) = match key.dtype() {
-        DType::I32 => (RADIX_PASSES_U32, 4usize),
-        DType::I64 => (RADIX_PASSES_U64, 8),
-        DType::U32 => (RADIX_PASSES_U32, 4),
-        DType::U64 => (RADIX_PASSES_U64, 8),
+        DType::I32 | DType::U32 => (RADIX_PASSES_U32, 4usize),
+        DType::I64 | DType::U64 => (RADIX_PASSES_U64, 8),
         _ => return gpu_sort_host_fallback(client, key, descending, nulls_last),
     };
 
@@ -1149,7 +1146,7 @@ fn gpu_radix_sort_key_indices(
 
     for pass_idx in 0..passes_usize {
         let shift_u32 = (pass_idx as u32) * 8;
-        let shift_u64 = shift_u32 as u64;
+        let shift_u64 = u64::from(shift_u32);
 
         match key.dtype() {
             DType::I32 | DType::U32 => {
@@ -1241,7 +1238,7 @@ fn gpu_sort_host_fallback(
     let mut permutation: Vec<u32> = (0..height).map(|i| i as u32).collect();
     sort_permutation(
         key_host.values(),
-        &key_host.validity(),
+        key_host.validity(),
         descending,
         nulls_last,
         &mut permutation,

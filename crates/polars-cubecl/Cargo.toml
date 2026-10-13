@@ -30,6 +30,7 @@ polars-plan = { workspace = true }
 polars-utils = { workspace = true }
 rustc-hash = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

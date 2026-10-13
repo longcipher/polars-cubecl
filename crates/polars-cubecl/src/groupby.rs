@@ -122,7 +122,7 @@ fn group_rows(key_columns: &[HostColumn]) -> Grouping {
                         .iter()
                         .take(height)
                         .fold((i32::MAX, i32::MIN), |(min, max), &v| (min.min(v), max.max(v)));
-                    let range = (max as i64 - min as i64 + 1).max(0) as usize;
+                    let range = (i64::from(max) - i64::from(min) + 1).max(0) as usize;
                     if range > 0 && range <= 65536 {
                         return group_single_dense_i32(values, height, min, range);
                     }
@@ -156,9 +156,9 @@ fn group_single_dense_i32(values: &[i32], height: usize, min: i32, range: usize)
     let mut sizes = Vec::new();
     let mut first_rows = Vec::new();
     let mut last_rows = Vec::new();
-    let min = min as i64;
-    for row in 0..height {
-        let bucket = (values[row] as i64 - min) as usize;
+    let min = i64::from(min);
+    for (row, &value) in values.iter().enumerate().take(height) {
+        let bucket = (i64::from(value) - min) as usize;
         let next = sizes.len() as u32;
         let id = match &mut dense_id[bucket] {
             Some(id) => *id,
@@ -185,8 +185,8 @@ fn group_single_dense_i64(values: &[i64], height: usize, min: i64, range: usize)
     let mut sizes = Vec::new();
     let mut first_rows = Vec::new();
     let mut last_rows = Vec::new();
-    for row in 0..height {
-        let bucket = (values[row] - min) as usize;
+    for (row, &value) in values.iter().enumerate().take(height) {
+        let bucket = (value - min) as usize;
         let next = sizes.len() as u32;
         let id = match &mut dense_id[bucket] {
             Some(id) => *id,
@@ -311,7 +311,7 @@ fn try_gpu_histogram_grouping(
     let min_val = bytemuck::cast_slice::<u8, i32>(&batch[0][..4])[0];
     let max_val = bytemuck::cast_slice::<u8, i32>(&batch[1][..4])[0];
 
-    let range = (max_val as i64 - min_val as i64 + 1).max(0) as usize;
+    let range = (i64::from(max_val) - i64::from(min_val) + 1).max(0) as usize;
     if range == 0 || range > GPU_HISTOGRAM_MAX_BUCKETS {
         return Ok(None);
     }
@@ -354,8 +354,8 @@ fn try_gpu_histogram_grouping(
     // non-empty buckets in bucket id order.
     let mut raw_first_rows = vec![u32::MAX; num_buckets];
     let mut raw_last_rows = vec![u32::MAX; num_buckets];
-    for row in 0..height {
-        let bucket = assign_raw[row] as usize;
+    for (row, &bucket_id) in assign_raw.iter().enumerate().take(height) {
+        let bucket = bucket_id as usize;
         if raw_first_rows[bucket] == u32::MAX {
             raw_first_rows[bucket] = row as u32;
         }
@@ -414,12 +414,21 @@ pub fn apply(
     // GPU histogram fast path: for single-column i32 keys with small range,
     // avoid downloading the key column entirely. Compute min/max + histogram
     // on the GPU; only counts (num_buckets * 4 bytes) round-trip to the host.
-    if keys.len() == 1 {
+    //
+    // Only safe when every agg is Sum: the raw bucket-id assignment from the
+    // histogram path is incompatible with the slot-based reductions (group_invert
+    // + per-slot reduce) used by Min/Max/Count/First/Last/Len/Mean — those need
+    // dense group IDs (0..num_groups-1), but the histogram path produces raw
+    // bucket IDs (0..num_buckets-1) that can be much larger. Mixing them causes
+    // out-of-bounds indexing in group_invert_kernel's seq/slots access.
+    let all_sum = aggs.iter().all(|a| matches!(a, Aggregation::Sum { .. }));
+    if all_sum && keys.len() == 1 {
         let key_col = &key_device_cols[0];
-        if key_col.dtype() == DType::I32 && height > 0 {
-            if let Some(grouping) = try_gpu_histogram_grouping(client, key_col, height)? {
-                return finish_grouping(client, f64_ok, columns, keys, aggs, grouping);
-            }
+        if key_col.dtype() == DType::I32 &&
+            height > 0 &&
+            let Some(grouping) = try_gpu_histogram_grouping(client, key_col, height)?
+        {
+            return finish_grouping(client, f64_ok, columns, keys, aggs, grouping);
         }
     }
 
@@ -509,9 +518,6 @@ fn finish_grouping(
                 DType::F32 => do_sum!(f32),
                 DType::F64 => do_sum!(f64),
                 DType::Bool => do_sum!(u8),
-                _ => {
-                    return Err(ExecError::NotExecutable(format!("direct sum for dtype {dtype:?}")))
-                }
             };
             output.push(DeviceColumn::from_handles(
                 name.clone(),

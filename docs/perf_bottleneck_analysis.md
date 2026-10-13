@@ -30,6 +30,7 @@ Every operator pipeline follows the same pattern: **ingest → N kernel launches
 **Total estimate: ~4.6 ms** (real: 10.2 ms Metal, ~5-7 ms CUDA with buffer pool)
 
 The remaining ~2-4 ms comes from:
+
 - Metal's higher per-launch cost (~1 ms vs CUDA's ~500 µs)
 - Memory allocation overhead (mitigated by buffer pool)
 - Polars CPU filter runs at 0.82 ms — the GPU overhead is 6-12x the total CPU time
@@ -60,6 +61,7 @@ The remaining ~2-4 ms comes from:
 ### 1.3 Group-by with `len()` (`group_by(g).agg([b.sum(), len()])`)
 
 Same as 1.2 plus:
+
 - `launch_reduce_sum_direct` for sum
 - `len()` is free (computed from sizes during histogram)
 - `materialize_keys` launches 1 gather kernel, downloads key column
@@ -83,11 +85,13 @@ Ranked by estimated wall-clock impact (CUDA, 1M rows, 3-column filter):
 ### P0 — reduce_sum Serial Kernel (dominant compute cost)
 
 The serial `reduce_sum_direct_kernel` runs ABSOLUTE_POS threads, each writing atomically:
+
 - At 1M rows / 64 groups: 1M atomic adds spread across 64 buckets
 - The kernel is limited by **atomic contention** on the 64 output slots
 - Even the serial-per-group kernel (1 thread per group, each loops 15625 elements) takes 4.89 ms — this is **GPU underutilization**: only 64 of 16384+ CUDA cores do useful work
 
 Why the parallel version is 17% slower:
+
 - 64 blocks × 256 threads = 16384 threads total
 - 64 block launch overhead (each block's thread 0 does 256 serial reads)
 - The serial baseline: 1 block × 256 threads, only 64 with work, serial loop = same throughput as 64 serial threads
@@ -96,6 +100,7 @@ Why the parallel version is 17% slower:
 ### P1 — Kernel Launch Overhead
 
 Each `launch_*` call costs ~500 µs (CUDA) or ~1 ms (Metal/wgpu):
+
 - CUDA: PTX→cubin JIT happens on first launch (~1 ms for first, ~500 µs for subsequent via Kache cache)
 - Metal: MSL→AIR→Metal pipeline compile, ~1 ms per distinct kernel
 - CPU backend: trivial (Function call)
@@ -105,6 +110,7 @@ For a filter with 3 data columns, we pay 6 launch overheads before doing any use
 ### P2 — Sync Points
 
 Every `client.read_one()` is a full pipeline flush + CUDA sync:
+
 - Filter: 1 sync (counts readback)
 - Group-by histogram: 3 syncs (validity check, min+max readback, histogram readback)
 - Each sync: ~500 µs on CUDA
@@ -138,6 +144,7 @@ if row_base < assignment.len() {
 ```
 
 **Challenge**: Atomic adds are per-element, so full vectorization requires either:
+
 - (a) Vector atomic adds (if backend supports `Atomic<Vector<T,N>>`)
 - (b) 4 separate scalar atomics per iteration (still reduces loop overhead by 4×)
 - (c) Shared-memory reduction within a block, then atomic add to global
@@ -149,18 +156,21 @@ if row_base < assignment.len() {
 **Approach**: Fuse multiple independent kernels into one. Two strategies:
 
 **3.2.1 Filter fusion** (cmp + count + scatter):
+
 - Currently: 3 launches (cmp→count→scatter) + 1 readback
 - Fused: 1 launch that produces counts directly from the comparison (no intermediate mask buffer)
 - Eliminates mask buffer allocation + 2 launches + 1 sync
 - Expected savings: ~1.5 ms on CUDA
 
 **3.2.2 Multi-column gather fusion** (filter):
+
 - Currently: N separate `launch_gather_values_mask` calls
 - Fused: 1 launch that gathers M columns from the same index vector
 - Requires either dynamic column count (virtual args) or comptime specialization
 - Expected: savings = (N-1) × 500 µs per filter
 
 **3.2.3 Group-by sum+count fusion**:
+
 - When query has both `sum()` and `count()`/`len()`, compute both in one kernel pass
 - Eliminates one redundant read of `values` + `assignment`
 - Expected: ~500 µs (one less launch)
@@ -168,11 +178,13 @@ if row_base < assignment.len() {
 ### 3.3 P2: Reduce Sync Points (Target: 3 syncs → 1 sync)
 
 **3.3.1 Batched readback for histogram path**:
+
 - Current: separate `read_one` for min, max, counts, assignment
 - Fix: Use CubeCL's `read_all` or batch handles into one sync
 - Saves ~1.0 ms on group-by (3 syncs → 1 sync)
 
 **3.3.2 Async readback with CUDA streams**:
+
 - Launch sum kernel before reading back histogram
 - Overlap kernel execution with host-side CPU work (first/last row computation)
 - Saves ~500 µs by overlapping CPU post-processing
@@ -206,6 +218,7 @@ Best case after all P0-P2 optimizations (CUDA, 1M rows):
 | **Ratio** | **12×** | **3.2×** |
 
 To beat the CPU at 1M rows, we need:
+
 - reduce_sum kernel < 300 µs (needs parallel reduction tree + warp shuffles)
 - Total launches ≤ 2
 - Total sync points ≤ 1
@@ -258,6 +271,7 @@ Add per-phase timing at the criterion level to measure individual kernel overhea
 ## 7. Conclusion
 
 The current performance is bounded by three compounding factors:
+
 1. **Kernel launch tax** (~500 µs each × 4-6 launches = 2-3 ms)
 2. **Sync point overhead** (~500 µs each × 2-3 = 1-1.5 ms)
 3. **Serial reduce kernel** (~4.9 ms at 1M/64)

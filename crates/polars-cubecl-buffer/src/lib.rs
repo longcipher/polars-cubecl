@@ -440,7 +440,7 @@ pub fn download_columns(
     }
     let batch = client.read(handles).map_err(|error| BufferError::Readback(error.to_string()))?;
     let mut out = Vec::with_capacity(columns.len());
-    for (column, chunks) in columns.iter().zip(batch.chunks_exact(2)) {
+    for (column, chunks) in columns.iter().zip(batch.as_chunks::<2>().0) {
         out.push(build_host_column(column, &chunks[0], &chunks[1])?);
     }
     Ok(out)
@@ -506,7 +506,7 @@ pub fn download_frame(client: &Client, columns: &[DeviceColumn]) -> Result<DataF
 
     // Rebuild host columns interleaving value / validity chunks from the
     // batch result.
-    for (column, chunks) in columns.iter().zip(batch.chunks_exact(2)) {
+    for (column, chunks) in columns.iter().zip(batch.as_chunks::<2>().0) {
         let value_bytes = &chunks[0];
         let validity_bytes = &chunks[1];
         let host = build_host_column(column, value_bytes, validity_bytes)?;

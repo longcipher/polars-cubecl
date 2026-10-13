@@ -34,7 +34,7 @@ impl CubeclEngine {
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
         let runtime = RuntimeContext::select(config.backend)?;
         if let Err(error) = polars_cubecl_kernels::warm_up(runtime.client()) {
-            eprintln!("[polars-cubecl] kernel warm-up skipped: {error}");
+            tracing::warn!("[polars-cubecl] kernel warm-up skipped: {error}");
         }
         Ok(Self { config, runtime })
     }
