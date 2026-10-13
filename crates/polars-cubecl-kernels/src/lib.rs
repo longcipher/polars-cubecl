@@ -2935,20 +2935,12 @@ mod inner {
     }
 
     /// Sum directly from the per-row group-assignment vector, bypassing
-    /// the group_invert + slots indirection.
-    ///
-    /// For the GPU histogram path, the `assignment[row]` is already on the
-    /// device. Rather than running `group_invert_kernel` (which builds the
-    /// slots array with atomics) and then `reduce_sum_kernel` (which reads
-    /// through slots), this kernel does the atomic add in one launch:
-    /// ~500µs less launch overhead and no slots buffer.
+    /// the group_invert + slots indirection. 4× unrolled to reduce block count.
     ///
     /// `out_values` must be zero-filled by the host before launch.
     ///
     /// Polars semantics: the sum of an all-null group is `0` (not null), so
-    /// every group's output is valid. We must initialize all `out_valid` bytes
-    /// to 1. Since the kernel is parallel, we write every group index exactly
-    /// once via a separate loop (unserialized initialization pass).
+    /// every group's output is valid.
     #[cube(launch)]
     pub fn reduce_sum_direct_kernel<T: Numeric>(
         values: &[T],
@@ -2964,11 +2956,16 @@ mod inner {
             out_valid[g] = 1u8;
         }
         // Accumulate values using the deterministic per-row assignment.
-        let row = ABSOLUTE_POS;
-        if row < assignment.len() {
-            let group = assignment[row] as usize;
-            if group < num_groups && valid[row] != 0u8 {
-                out_values[group].fetch_add(values[row]);
+        // 4 rows per thread (stride-4 unrolling for reduced block count).
+        let row_base = ABSOLUTE_POS * 4usize;
+        let len = assignment.len();
+        for offset in 0..4usize {
+            let row = row_base + offset;
+            if row < len {
+                let group = assignment[row] as usize;
+                if group < num_groups && valid[row] != 0u8 {
+                    out_values[group].fetch_add(values[row]);
+                }
             }
         }
     }

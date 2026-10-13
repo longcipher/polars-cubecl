@@ -304,13 +304,12 @@ fn try_gpu_histogram_grouping(
         &minmax_valid_handle,
     )?;
 
-    // 4. Read back min + max (8 bytes total).
-    let min_bytes =
-        client.read_one(min_val_handle).map_err(|error| ExecError::Launch(error.to_string()))?;
-    let max_bytes =
-        client.read_one(max_val_handle).map_err(|error| ExecError::Launch(error.to_string()))?;
-    let min_val = bytemuck::cast_slice::<u8, i32>(&min_bytes[..4])[0];
-    let max_val = bytemuck::cast_slice::<u8, i32>(&max_bytes[..4])[0];
+    // 4. Read back min + max in one batched sync (was 2 separate read_one calls).
+    let batch = client
+        .read(vec![min_val_handle, max_val_handle])
+        .map_err(|e| ExecError::Launch(e.to_string()))?;
+    let min_val = bytemuck::cast_slice::<u8, i32>(&batch[0][..4])[0];
+    let max_val = bytemuck::cast_slice::<u8, i32>(&batch[1][..4])[0];
 
     let range = (max_val as i64 - min_val as i64 + 1).max(0) as usize;
     if range == 0 || range > GPU_HISTOGRAM_MAX_BUCKETS {
@@ -337,18 +336,16 @@ fn try_gpu_histogram_grouping(
         height,
         num_buckets,
     )?;
-    let counts_bytes =
-        client.read_one(histo_counts).map_err(|error| ExecError::Launch(error.to_string()))?;
-    let counts: &[u32] = bytemuck::cast_slice(&counts_bytes);
+    // Read back counts + assignment in one batched sync (was 2 separate reads).
+    let batch = client
+        .read(vec![histo_counts, assignment_handle.clone()])
+        .map_err(|e| ExecError::Launch(e.to_string()))?;
+    let counts: &[u32] = bytemuck::cast_slice(&batch[0]);
     let counts: Vec<u32> = counts.iter().take(num_buckets).copied().collect();
 
-    // Read back the deterministic per-row assignment (4 * height bytes).
     // `out[row] = bucket` is written by exactly one thread per row, so the
     // result is reproducible across CPU and GPU backends.
-    let assign_bytes = client
-        .read_one(assignment_handle.clone())
-        .map_err(|error| ExecError::Launch(error.to_string()))?;
-    let assign_raw: &[u32] = bytemuck::cast_slice(&assign_bytes);
+    let assign_raw: &[u32] = bytemuck::cast_slice(&batch[1]);
 
     // Build Grouping sizes, first_rows, last_rows on the CPU from the
     // deterministic assignment. The slots-based path in finish_grouping

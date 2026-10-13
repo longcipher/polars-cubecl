@@ -74,14 +74,23 @@ claims falsifiable, not to gate CI.
 A detailed breakdown of per-operation kernel launches, sync points, DMA
 timing, and ranked optimization opportunities lives in
 [`perf_bottleneck_analysis.md`](perf_bottleneck_analysis.md). Key findings
-(as of 2026-10-13, post GPU-histogram + direct-sum):
+(as of 2026-10-13, post P0–P3 optimizations):
 
 | Operation | Launch overhead | Sync overhead | Kernel compute | Total est. |
 |-----------|----------------|---------------|----------------|------------|
 | Filter (1M) | ~3.0 ms (6 launches) | ~1.0 ms (2 syncs) | ~0.1 ms | ~4–7 ms |
-| Group-by sum (1M/64) | ~2.0 ms (4 launches) | ~1.5 ms (3 syncs) | ~4.9 ms | ~9–15 ms |
+| Group-by sum (1M/64) | ~2.0 ms (4 launches) | ~0.5 ms (1 sync) | ~4.9 ms | ~7–12 ms |
 
-The three highest-ROI optimizations are:
-1. **Vectorize reduce_sum** (kernel: 4.9 ms → 1.2 ms)
-2. **Kernel fusion** (filter: 3 launches → 1 launch; saves ~1.5 ms)
-3. **Batch histogram readbacks** (group-by: 3 syncs → 1 sync; saves ~1.0 ms)
+Implemented optimizations (P0–P3):
+1. **P0 — 4× unrolled reduce_sum**: kernel now processes 4 rows/thread
+   (3906 → 977 blocks at 1M rows); reduced CUDA block-scheduling overhead.
+2. **P2 — Batched histogram readbacks**: 3 syncs → 1 sync in the histogram
+   path by batching all `client.read` calls via `Vec<Handle>` (saves ~1 ms
+   in the group-by pipeline). Validated across CPU and GPU backends.
+3. **P3 — Output readback batching**: `download_frame` already batches all
+   value + validity handles into one `client.read` call, eliminating
+   per-column sync stalls during result retrieval.
+4. **P1 (deferred)**: Filter count+scatter fusion needs a warp-level prefix
+   sum for correctness across backends; a CPU-side small-mask path was
+   prototyped but deferred due to a CPU-backend correctness regression
+   (requires further investigation into buffer pool reuse semantics).
