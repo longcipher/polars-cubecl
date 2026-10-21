@@ -2,19 +2,19 @@
 default:
   @just --list
 
-# Format all code
+# Format markdown, TOML and Rust sources
 format:
   rumdl fmt .
   cargo sort -w -g
   cargo +nightly fmt --all
 
-# Auto-fix linting issues
+# Auto-fix what `format` cannot: markdown lints, clippy findings, inheritance drift
 fix:
   rumdl check --fix .
   RUSTC_WRAPPER= cargo +nightly clippy --fix --all --allow-dirty
   cargo workspace-inheritance-check --fix
 
-# Run all lints
+# Run all lints (every tool used here is installed by .github/workflows/ci.yml)
 lint:
   typos
   rumdl check .
@@ -22,25 +22,30 @@ lint:
   cargo +nightly fmt --all -- --check
   RUSTC_WRAPPER= cargo +nightly clippy --workspace --all-targets -- -D warnings
   cargo shear
+
+# cargo-workspace-inheritance-check is not in the CI image, so it is kept out of `lint`.
+#
+# Check that every member inherits version/edition/license/repository from the workspace
+inheritance-check:
   cargo workspace-inheritance-check
 
-# Run tests
-# Note: --all-features is skipped here because polars-ops 0.55.2 has a
-# pre-existing compilation error with the `dtype-decimal` feature enabled
-# (unhandled `Decimal` variant in `unique.rs`). Use `--all-features` only
-# after bumping polars or patching the upstream match.
+# `--all-features` is deliberately not used: the pinned `polars 0.55.2` tree
+# fails to compile with the `dtype-decimal` feature enabled (upstream reports
+# an unhandled `Decimal` variant in `unique.rs`). Re-enable `--all-features`
+# only after bumping `polars` or patching the upstream match.
+#
+# Run the workspace test suite on the default (cpu) backend
 test:
   cargo test --workspace
 
-# Run mutation tests with cargo-mutants, scoped to the CPU-testable crates
-# (see .cargo/mutants.toml for the rationale).
 # `RUSTC_WRAPPER` is cleared on purpose: the `kache` cache has served stale
-# objects to mutant scratch builds in the past (mutants proven killable by
-# hand survived a cached run), and a mutation gate must never pass on cache
-# luck. Mutants also need `POLARS_CUBECL_REQUIRE_BACKENDS=cpu` in the
-# environment so the (CPU-only) unit suites stay deterministic.
+# objects to mutant scratch builds before (mutants proven killable by hand
+# survived a cached run), and a mutation gate must never pass on cache luck.
+# See .cargo/mutants.toml for the scope and the excluded-mutant rationale.
+#
+# Run mutation tests with cargo-mutants on the CPU-testable crates
 mutation:
-  RUSTC_WRAPPER= cargo mutants --package polars-cubecl-lower --package polars-cubecl-buffer --package polars-cubecl-runtime
+  RUSTC_WRAPPER= POLARS_CUBECL_REQUIRE_BACKENDS=cpu cargo mutants --package polars-cubecl-lower --package polars-cubecl-buffer --package polars-cubecl-runtime
 
 # Run tests with coverage
 test-coverage:
@@ -58,13 +63,19 @@ check:
 publish-check:
   cargo publish --workspace --dry-run --allow-dirty
 
-# Publish all crates to crates.io
+# Publish all crates to crates.io (irreversible: run only with a registry token)
 publish:
   cargo publish --workspace
 
-# Check for Chinese characters
+# Fail if Chinese characters are present in tracked files
 check-cn:
-  rg --line-number --column "\p{Han}"
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if rg --line-number --column "\p{Han}" . ; then
+    echo "error: Chinese characters found" >&2
+    exit 1
+  fi
+  echo "ok: no Chinese characters found"
 
 # Full CI check
 ci: lint test build
@@ -85,11 +96,10 @@ setup:
   cargo install cargo-workspace-inheritance-check
   cargo install typos-cli
   cargo install rumdl
-  cargo install leptosfmt
   cargo install cargo-llvm-cov
   cargo install cargo-nextest
-  cargo install cargo-deny
   cargo install cargo-audit
+  cargo install cargo-outdated
 
 # Generate documentation for the workspace
 docs:
@@ -105,7 +115,7 @@ outdated:
 
 # Run clippy with all lints
 clippy-all:
-  cargo +nightly clippy --all-targets --all-features -- -W clippy::pedantic -W clippy::nursery -W clippy::cargo
+  RUSTC_WRAPPER= cargo +nightly clippy --all-targets --all-features -- -W clippy::pedantic -W clippy::nursery -W clippy::cargo
 
 # Run tests with nextest
 test-nextest:
@@ -122,18 +132,6 @@ unused-deps:
 # Update all dependencies
 update-deps:
   cargo update
-
-# Check licenses
-license-check:
-  cargo deny check licenses
-
-# Check advisories
-advisory-check:
-  cargo deny check advisories
-
-# Check bans
-ban-check:
-  cargo deny check bans
 
 # Full check (lint + test + build + audit)
 full-check: lint test build audit
