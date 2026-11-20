@@ -21,7 +21,7 @@
 - Parallelize aggressively: dispatch subagents for independent research, exploration, and implementation.
 - NEVER run two `cargo` commands concurrently, and never overlap file edits with a running `cargo` command (`target/` file lock): finish edits, wait, then run.
 - NEVER use `git worktree`. Edit the current branch in place.
-- TDD for behavior changes: failing test first, smallest change to pass, then run `just mutation` and fix surviving mutants.
+- TDD for behavior changes: failing test first, smallest change to pass, then run the mutation gate only when the current spec task declares `Mutation:`, and fix surviving mutants.
 
 ## Verification loop
 
@@ -31,10 +31,15 @@ After each feature or bug fix, in order; any failure means the task is not done:
 just format
 just lint
 just test
-just mutation
 ```
 
-`just lint` is the CI gate: `typos`, `rumdl`, `cargo sort --check`, `cargo +nightly fmt --check`, `cargo +nightly clippy -D warnings`, `cargo shear`. `just mutation` only mutates the three crates selected in `.cargo/mutants.toml`.
+Mutation testing is intentionally absent from the default loop and from CI. When a spec task
+declares `Mutation: <src-glob>`, follow the `/pb-build` gate: write the changed file's diff to a
+temp file and run `cargo mutants --in-diff <diff-file>` for that file only, with at most 3 files /
+60 mutants / 300 s. Never add a whole-repo mutation recipe: `just check-mutation-scope` fails
+`just lint` when an unbounded mutation command appears in a build or CI file.
+
+`just lint` is the CI gate: `typos`, `rumdl`, `cargo sort --check`, `cargo +nightly fmt --check`, `cargo +nightly clippy -D warnings`, `cargo shear`. The mutation gate mutates only the changed lines, within the /pb-build budget (at most 3 files / 60 mutants / 300 s).
 
 ## Rust workspace rules
 
