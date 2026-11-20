@@ -2,6 +2,7 @@
 pipelining = true
 jobs = 10
 rustc-wrapper = "kache"
+warnings = "deny"
 
 [registries.crates-io]
 protocol = "sparse"
@@ -12,3 +13,10 @@ retry = 3
 
 [term]
 progress.when = "never"
+
+[resolver]
+incompatible-rust-versions = "fallback"
+
+[registry]
+default = "crates-io"
+global-min-publish-age = "5 days"

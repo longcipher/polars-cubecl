@@ -39,7 +39,7 @@ temp file and run `cargo mutants --in-diff <diff-file>` for that file only, with
 60 mutants / 300 s. Never add a whole-repo mutation recipe: `just check-mutation-scope` fails
 `just lint` when an unbounded mutation command appears in a build or CI file.
 
-`just lint` is the CI gate: `typos`, `rumdl`, `cargo sort --check`, `cargo +nightly fmt --check`, `cargo +nightly clippy -D warnings`, `cargo shear`. The mutation gate mutates only the changed lines, within the /pb-build budget (at most 3 files / 60 mutants / 300 s).
+`just lint` is the CI gate: `typos`, `rumdl`, `cargo sort --check`, `cargo +nightly fmt --check`, `cargo +nightly clippy -D warnings`, Cargo's native `unused_dependencies` lint. The mutation gate mutates only the changed lines, within the /pb-build budget (at most 3 files / 60 mutants / 300 s).
 
 ## Rust workspace rules
 
@@ -52,6 +52,12 @@ temp file and run `cargo mutants --in-diff <diff-file>` for that file only, with
 - `.cargo/config.toml` sets `rustc-wrapper = "kache"`; clippy invocations must clear it (`RUSTC_WRAPPER=`) exactly as the Justfile does.
 - The toolchain is nightly (`rust-toolchain.toml`): use `cargo +nightly fmt` and `cargo +nightly clippy`, never bare `cargo fmt`.
 - Never hand-type dependency versions. Shared crates go into root `[workspace.dependencies]` and members reference them with `workspace = true`.
+
+## Rust 1.100 baseline
+
+- Workspace MSRV is Rust 1.100. Prefer newly stabilized features and APIs over older workarounds; do not add feature gates for anything already stable in 1.100.
+- `[workspace.lints.cargo]` enables Cargo's native `unused_dependencies` lint, the only unused-dependency check; do not reintroduce a third-party checker. Its level is `warn`, and `.cargo/config.toml` sets `build.warnings = "deny"`, so a finding fails the gate.
+- `.cargo/config.toml` sets resolver `incompatible-rust-versions = "fallback"` (MSRV-aligned resolution) and `registry.global-min-publish-age = "5 days"` (Rust 1.100 dependency cooldown); keep both.
 
 ## Dependency choices
 

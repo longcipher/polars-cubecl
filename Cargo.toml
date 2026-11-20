@@ -8,6 +8,7 @@ version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/longcipher/polars-cubecl"
+rust-version = "1.100"
 
 [workspace.dependencies]
 bytemuck = "1.25.2"
@@ -204,9 +205,15 @@ missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 unreachable_pub = "allow"
 unused_must_use = "deny"
+raw_borrows_via_references = "warn"
 
 [workspace.lints.rustdoc]
 all = "warn"
+
+# Cargo's own lint system (shipped in 1.100): the only unused-dependency
+# check. It runs as part of a normal all-targets `cargo check`/`clippy`.
+[workspace.lints.cargo]
+unused_dependencies = "warn"
 
 # Vendored `branches` (toolchain-compat fix for the `metal`/`vulkan` backend
 # graph). Applies to builds of this workspace only.

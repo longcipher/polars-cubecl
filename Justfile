@@ -21,7 +21,6 @@ lint:
   cargo sort -w -g -c
   cargo +nightly fmt --all -- --check
   RUSTC_WRAPPER= cargo +nightly clippy --workspace --all-targets -- -D warnings
-  cargo shear
   just check-mutation-scope
 
 # cargo-workspace-inheritance-check is not in the CI image, so it is kept out of `lint`.
@@ -194,7 +193,6 @@ clean:
 # Install all required development tools
 setup:
   cargo install cargo-mutants
-  cargo install cargo-shear
   cargo install cargo-sort
   cargo install cargo-workspace-inheritance-check
   cargo install typos-cli
@@ -227,10 +225,6 @@ test-nextest:
 # Run miri on unsafe code
 miri:
   cargo +nightly miri test --all-features
-
-# Check for unused dependencies
-unused-deps:
-  cargo shear --check
 
 # Update all dependencies
 update-deps:
