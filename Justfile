@@ -34,6 +34,10 @@ inheritance-check:
 # an unhandled `Decimal` variant in `unique.rs`). Re-enable `--all-features`
 # only after bumping `polars` or patching the upstream match.
 #
+# Run the prek commit hooks on every tracked file (requires prek)
+hooks:
+  prek run --all-files
+
 # Run the workspace test suite on the default (cpu) backend
 test:
   cargo test --workspace
